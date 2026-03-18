@@ -1,2 +1,26 @@
 # Downloader
 Download datasets for ai training from Neurvance
+
+MIT License with Commons Clause
+
+Copyright (c) 2026 [Adam Samer Daabas / Neurvance]
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, and distribute the Software, subject to the
+following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+Commons Clause Restriction:
+The Software is provided to you by the Licensor under the MIT License,
+as defined above, and Licensor grants you the right to use the Software.
+However, selling the Software is not permitted. For purposes of this clause,
+"selling" means selling, sublicensing, or distributing the Software for a fee,
+whether in source, binary, or SaaS form. Training AI models using data
+obtained through the Software is explicitly permitted, including for
+commercial purposes.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
