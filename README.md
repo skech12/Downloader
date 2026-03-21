@@ -1,26 +1,86 @@
-# Downloader
-Download datasets for ai training from Neurvance
+# Neurvance Downloader
 
-MIT License with Commons Clause
+[![License: MIT + Commons Clause](https://img.shields.io/badge/license-MIT%20%2B%20Commons%20Clause-blue.svg)](LICENSE)
+[![Datasets](https://img.shields.io/badge/datasets-12%2C500%2B-brightgreen)](https://neurvance.com/datasets)
+[![Version](https://img.shields.io/pypi/v/neurvance-downloader?label=version)](https://pypi.org/project/neurvance-downloader)
+[![CC0](https://img.shields.io/badge/data-CC0%20licensed-orange)](https://creativecommons.org/publicdomain/zero/1.0/)
 
-Copyright (c) 2026 [Adam Samer Daabas / Neurvance]
+## 12,500+ CC0 datasets for AI fine-tuning — download free or use the API
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, and distribute the Software, subject to the
-following conditions:
+You write the training code. We handle the data pipeline.
 
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
+Free to download manually. API key unlocks bulk and incremental access — so you never have to scrape, clean, or format training data again.
 
-Commons Clause Restriction:
-The Software is provided to you by the Licensor under the MIT License,
-as defined above, and Licensor grants you the right to use the Software.
-However, selling the Software is not permitted. For purposes of this clause,
-"selling" means selling, sublicensing, or distributing the Software for a fee,
-whether in source, binary, or SaaS form. Training AI models using data
-obtained through the Software is explicitly permitted, including for
-commercial purposes.
+→ **[Browse the full dataset catalog on neurvance.com](https://neurvance.com/datasets)**
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+---
+
+## Quick Start
+
+```bash
+pip install neurvance-downloader
+```
+
+```python
+from neurvance import Neurvance
+
+nv = Neurvance(api_key="YOUR_API_KEY")  # free key at neurvance.com
+nv.download("customer-support-qa")      # done — ready for training
+```
+
+That's it. Cleaned, formatted, and ready to plug straight into your fine-tuning script.
+
+---
+
+## Demo
+
+> GIF coming soon — CLI walkthrough showing dataset search, download, and inspection.
+
+---
+
+## Why Neurvance?
+
+Most fine-tuning projects waste 70%+ of engineering time on data prep. Cleaning messy scrapes, reformatting, deduplicating — before you've written a single line of training code.
+
+Neurvance flips that. Every dataset is:
+
+- **Pre-cleaned** — no junk rows, no encoding issues
+- **CC0 licensed** — no legal headaches for commercial use
+- **Ready-formatted** — JSONL out of the box, compatible with most fine-tuning frameworks
+
+---
+
+## API Access
+
+Free manual downloads, always. API key for bulk or incremental access.
+
+| Plan | Access | Datasets |
+|------|--------|----------|
+| Free | Manual download | All 12,500+ |
+| API | Bulk + incremental | All 12,500+ |
+
+Get your key at **[neurvance.com](https://neurvance.com)**
+
+---
+
+## Example Fine-Tuning
+
+See `examples/` for a full notebook: fine-tune Mistral or Llama 3 on a Neurvance dataset using Unsloth in under 10 minutes.
+
+---
+
+## Dataset Catalog
+
+See [DATASETS.md](DATASETS.md) for the full searchable list organized by domain.
+
+---
+
+## Contributing
+
+Want a dataset that's not here? Open a GitHub Issue or start a Discussion — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+---
+
+## License
+
+MIT + Commons Clause. Free for personal and commercial AI training use. You cannot sell the software itself.
