@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+"""Semantic-ish search over Wasabi-backed catalog via POST /api/tui/rag/query.
+
+Uses the same GitHub JWT + /api/tui/session flow as downloadTUI.py — no API keys in this script.
+"""
+
 import argparse
 import hashlib
 import sys
@@ -9,7 +15,7 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
 
-import download as dt
+import downloadTUI as dt
 
 console = Console()
 
@@ -49,8 +55,8 @@ def print_results(data: dict, verbose: bool):
         return
     table = Table(title="Search results", show_header=True)
     table.add_column("#", justify="right")
-    table.add_column("Key", max_width=48)
-    table.add_column("Snippet", max_width=70)
+    table.add_column("Key", max_width=56, overflow="fold")
+    table.add_column("Snippet", overflow="fold")
     for i, r in enumerate(rows, 1):
         table.add_row(str(i), r.get("key", ""), r.get("snippet", ""))
     console.print(table)
