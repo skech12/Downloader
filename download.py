@@ -964,10 +964,8 @@ def interactive(output_dir="downloads", workers=DEFAULT_WORKERS,
             f"{len(categories)} categories[/dim]\n"
         )
         console.print("[bold]Commands:[/bold]")
-        console.print("  [yellow]1-N[/yellow]     download category  "
-                       "(multi: [bold]1,3,5[/bold] or [bold]2-4[/bold])")
+        console.print("  [yellow]1-N[/yellow]     download one category (single number only)")
         console.print("  [yellow]l N[/yellow]     list & browse files in category N")
-        console.print("  [yellow]0[/yellow]       download ALL datasets")
         console.print("  [yellow]g[/yellow]       gradual download (streaming batches)")
         console.print("  [yellow]s[/yellow]       search datasets")
         console.print("  [yellow]h[/yellow]       download history")
@@ -1012,8 +1010,8 @@ def interactive(output_dir="downloads", workers=DEFAULT_WORKERS,
                     console.print(
                         "\n[bold]n[/bold]=next  [bold]p[/bold]=prev  "
                         "[bold]p N[/bold]=preview  "
-                        "[bold]d 1,3,5[/bold]=download  "
-                        "[bold]d all[/bold]=download all  [bold]b[/bold]=back"
+                        "[bold]d 1,3,5[/bold]=download selected  "
+                        "[bold]b[/bold]=back"
                     )
                     act = Prompt.ask("[bold cyan]›").strip().lower()
                     if act in ("n", "next") and page < pages:
@@ -1030,26 +1028,20 @@ def interactive(output_dir="downloads", workers=DEFAULT_WORKERS,
                     elif act.startswith("d"):
                         arg = act[1:].strip()
                         if arg in ("all", "*", ""):
-                            to_dl = [{"key": r["key"], "size": r["size"]}
-                                     for r in results]
-                        else:
-                            idxs = parse_selection(arg, len(results))
-                            to_dl = [{"key": results[i - 1]["key"],
-                                      "size": results[i - 1]["size"]}
-                                     for i in idxs]
+                            console.print(
+                                "[yellow]Use explicit indices, e.g. [bold]d 1,3,5[/bold] "
+                                "(bulk download-all is disabled).[/yellow]"
+                            )
+                            continue
+                        idxs = parse_selection(arg, len(results))
+                        to_dl = [{"key": results[i - 1]["key"],
+                                  "size": results[i - 1]["size"]}
+                                 for i in idxs]
                         if to_dl:
                             download_keys(to_dl, output_dir, workers, skip_confirm)
                         break
                     elif act in ("b", "back"):
                         break
-
-            elif choice == "0":
-                all_keys = [
-                    {"key": f[2], "size": f[3] if len(f) > 3 else 0}
-                    for cat_files in all_files.values()
-                    for f in cat_files
-                ]
-                download_keys(all_keys, output_dir, workers, skip_confirm)
 
             elif choice == "g":
                 # Gradual / streaming batch download
@@ -1059,16 +1051,24 @@ def interactive(output_dir="downloads", workers=DEFAULT_WORKERS,
                     bs = max(1, int(bs))
                 except ValueError:
                     bs = 10
-                cat_choice = Prompt.ask(
-                    "[bold cyan]Category number (or 'all')",
-                    default="all"
-                ).strip().lower()
                 cat_filter = None
-                if cat_choice not in ("all", "*", ""):
+                while cat_filter is None:
+                    cat_choice = Prompt.ask(
+                        f"[bold cyan]Category number (1–{len(categories)}) or name"
+                    ).strip()
+                    if not cat_choice:
+                        console.print("[yellow]A category is required (no whole-catalog stream).[/yellow]")
+                        continue
+                    low = cat_choice.lower()
+                    if low in ("all", "*"):
+                        console.print("[yellow]Pick a single category; 'all' is not allowed.[/yellow]")
+                        continue
                     try:
                         cat_idx = int(cat_choice)
                         if 1 <= cat_idx <= len(categories):
                             cat_filter = categories[cat_idx - 1]
+                        else:
+                            console.print("[yellow]Invalid category number.[/yellow]")
                     except ValueError:
                         cat_filter = cat_choice
                 do_cleanup = Confirm.ask(
@@ -1092,13 +1092,17 @@ def interactive(output_dir="downloads", workers=DEFAULT_WORKERS,
                 if not nums:
                     console.print("[yellow]Invalid selection.[/yellow]")
                     continue
-                all_keys = []
-                for n in nums:
-                    cat = categories[n - 1]
-                    all_keys.extend(
-                        {"key": f[2], "size": f[3] if len(f) > 3 else 0}
-                        for f in all_files.get(cat, [])
+                if len(nums) > 1:
+                    console.print(
+                        "[yellow]Download one category at a time (e.g. [bold]3[/bold] only).[/yellow]"
                     )
+                    continue
+                n = nums[0]
+                cat = categories[n - 1]
+                all_keys = [
+                    {"key": f[2], "size": f[3] if len(f) > 3 else 0}
+                    for f in all_files.get(cat, [])
+                ]
                 download_keys(all_keys, output_dir, workers, skip_confirm)
 
         except APILimitError as e:
@@ -1116,7 +1120,7 @@ def main():
     parser.add_argument("-c", "--category", default=None,
                         help="Download a specific category (name or substring)")
     parser.add_argument("-s", "--search", default=None, dest="query",
-                        help="Search and download matching files")
+                        help="(Disabled) Use interactive mode: command s, then d 1,2,3")
     parser.add_argument("-y", "--yes", action="store_true",
                         help="Skip download confirmation prompts")
     parser.add_argument("-w", "--workers", type=int, default=DEFAULT_WORKERS,
@@ -1152,6 +1156,20 @@ def main():
         console.print("[red]Authentication failed.[/red]")
         sys.exit(1)
 
+    if args.stream and not args.category:
+        console.print(
+            "[red]Streaming mode requires [-c|--category] (one category per run).[/red]"
+        )
+        sys.exit(1)
+
+    if args.query and not args.category and not args.stream:
+        console.print(
+            "[red]Non-interactive --search download is disabled. "
+            "Run without flags and use [bold]s[/bold], then "
+            "[bold]d 1,2,3[/bold] for specific rows.[/red]"
+        )
+        sys.exit(1)
+
     if not acquire_session():
         sys.exit(1)
 
@@ -1185,24 +1203,6 @@ def main():
                 return
             console.print(f"[green]Found {len(keys)} files[/green]")
             download_keys(keys, args.output, args.workers, args.yes)
-            return
-
-        # Non-interactive: --search
-        if args.query:
-            console.print(f"[bold cyan]Searching: {args.query}[/bold cyan]")
-            with console.status("[bold cyan]Loading data…"):
-                data = api_get("/api/tui/files")
-            all_files = {
-                cat: [(f["uploader"], f["filename"], f["key"], f["size"]) for f in files]
-                for cat, files in data["files"].items()
-            }
-            results = search(args.query, all_files)
-            if not results:
-                console.print(f"[red]No results for '{args.query}'[/red]")
-                return
-            console.print(f"[green]Found {len(results)} files[/green]")
-            to_dl = [{"key": r["key"], "size": r["size"]} for r in results]
-            download_keys(to_dl, args.output, args.workers, args.yes)
             return
 
         # Interactive mode
