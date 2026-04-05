@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-"""Semantic-ish search over Wasabi-backed catalog via POST /api/tui/rag/query.
-
-Uses the same GitHub JWT + /api/tui/session flow as downloadTUI.py — no API keys in this script.
-"""
-
 import argparse
 import hashlib
 import sys
