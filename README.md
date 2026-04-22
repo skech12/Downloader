@@ -1,83 +1,83 @@
 # Neurvance Downloader
 
 [![License: MIT + Commons Clause](https://img.shields.io/badge/license-MIT%20%2B%20Commons%20Clause-blue.svg)](LICENSE)
-[![Datasets](https://img.shields.io/badge/datasets-12%2C500%2B-brightgreen)](https://neurvance.com/datasets)
-[![Version](https://img.shields.io/pypi/v/neurvance-downloader?label=version)](https://pypi.org/project/neurvance-downloader)
 [![CC0](https://img.shields.io/badge/data-CC0%20licensed-orange)](https://creativecommons.org/publicdomain/zero/1.0/)
 
-## 12,500+ CC0 datasets for AI fine-tuning — download free or use the API
+## Curated training data and RAG infrastructure for production ML
 
-You write the training code. We handle the data pipeline.
+Neurvance delivers curated, pre-cleaned datasets through a terminal client — no scraping, no formatting, no data prep. You browse bundles, pick what you need, and download a ready-to-train zip.
 
-Free to download manually. API key unlocks bulk and incremental access — so you never have to scrape, clean, or format training data again.
-
-→ **[Browse the full dataset catalog on neurvance.com](https://neurvance.com/datasets)**
+→ **[Browse bundles and subscribe at neurvance.com](https://neurvance.com)**
 
 ---
 
-## Quick Start
+## How It Works
+
+1. **Install dependencies**
+
+   ```bash
+   pip install requests rich python-dotenv
+   ```
+
+2. **Run the downloader**
+
+   ```bash
+   python download.py
+   ```
+
+   A browser window opens for GitHub login. Once authenticated, you'll see the full bundle catalog in your terminal.
+
+3. **Browse and download**
+
+   Pick a bundle by number, preview its files and size, then confirm to download. The server scrubs PII, toxicity, and bias filters in transit — the zip arrives clean.
+
+---
+
+## Non-interactive download
 
 ```bash
-pip install neurvance-downloader
+python download.py --bundle <slug> --output-dir ./data
 ```
+
+---
+
+## RAG Search
+
+Query the catalog with natural language using `rag.py`:
+
+```bash
+python rag.py -q "medical imaging classification"
+```
+
+---
+
+## CC0 Content API
+
+`cc0_content.py` is a single-file Python client for the CC0 Content API:
 
 ```python
-from neurvance import Neurvance
+from cc0_content import CC0Client
 
-nv = Neurvance(api_key="YOUR_API_KEY")  # free key at neurvance.com
-nv.download("customer-support-qa")      # done — ready for training
+client = CC0Client()  # opens browser for login on first run
+results = client.search("history of rome")
+print(results["chunks"])
 ```
 
-That's it. Cleaned, formatted, and ready to plug straight into your fine-tuning script.
-
 ---
 
-## Demo
+## Pricing
 
-> GIF coming soon — CLI walkthrough showing dataset search, download, and inspection.
+**Starter — €49/month**, billed monthly. Cancel anytime.
 
----
+Includes access to the full bundle catalog via the Downloader client and RAG queries.
 
-## Why Neurvance?
-
-Most fine-tuning projects waste 70%+ of engineering time on data prep. Cleaning messy scrapes, reformatting, deduplicating — before you've written a single line of training code.
-
-Neurvance flips that. Every dataset is:
-
-- **Pre-cleaned** — no junk rows, no encoding issues
-- **CC0 licensed** — no legal headaches for commercial use
-- **Ready-formatted** — JSONL out of the box, compatible with most fine-tuning frameworks
-
----
-
-## API Access
-
-Free manual downloads, always. API key for bulk or incremental access.
-
-| Plan | Access | Datasets |
-|------|--------|----------|
-| Free | Manual download | All 12,500+ |
-| API | Bulk + incremental | All 12,500+ |
-
-Get your key at **[neurvance.com](https://neurvance.com)**
-
----
-
-## Example Fine-Tuning
-
-See `examples/` for a full notebook: fine-tune Mistral or Llama 3 on a Neurvance dataset using Unsloth in under 10 minutes.
+Get your API key at **[neurvance.com](https://neurvance.com)**
 
 ---
 
 ## Dataset Catalog
 
 See [DATASETS.md](DATASETS.md) for the full searchable list organized by domain.
-
----
-
-## Contributing
-
-Want a dataset that's not here? Open a GitHub Issue or start a Discussion — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
