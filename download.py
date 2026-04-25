@@ -1,13 +1,3 @@
-"""Neurvance Datasite TUI — bundle browser + downloader.
-
-The catalog source-of-truth is Supabase: each bundle is a curated set of
-``files`` rows whose ``download_link`` points at an upstream host (HuggingFace,
-Zenodo, GitHub release, etc.). The backend streams the bundle as a zip,
-scrubbing PII/GDPR text in flight; the TUI just receives bytes and writes
-them to disk. Each download costs 1 API call — repeats are not free.
-
-Nothing about the catalog is cached client-side: every browse hits the API.
-"""
 
 from __future__ import annotations
 
@@ -21,7 +11,6 @@ import threading
 import warnings
 import webbrowser
 import zipfile
-from collections import Counter
 from pathlib import Path
 from urllib.parse import quote as _url_quote
 
@@ -53,7 +42,7 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 console = Console()
 
 API_BASE_URL = os.getenv("DATASITE_API_URL", "https://neurvance-bb82540cb249.herokuapp.com")
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.0.0"
 DEFAULT_OUTPUT_DIR = Path.cwd() / "neurvance_downloads"
 TOKEN_FILE = Path.home() / ".datasite" / "config.json"
 
@@ -152,7 +141,7 @@ def ensure_authenticated() -> bool:
 
 
 def acquire_session() -> bool:
-    """POST /api/tui/session — charges 1 API call, returns a session token."""
+    """POST /api/tui/session. Free; returns a short-lived session token."""
     global _session_token
     if _session_token:
         return True
@@ -178,10 +167,11 @@ def acquire_session() -> bool:
     resp.raise_for_status()
     data = resp.json()
     _session_token = data["session_token"]
-    console.print(
-        f"[green]Session started — 1 API call charged, "
-        f"{data.get('calls_remaining', '?')} remaining[/green]"
-    )
+    remaining = data.get("calls_remaining")
+    if remaining is not None:
+        console.print(f"[green]Session ready - {remaining} credits remaining[/green]")
+    else:
+        console.print("[green]Session ready[/green]")
     return True
 
 
@@ -195,6 +185,17 @@ def _auth_headers() -> dict:
     return {}
 
 
+def _detail_or_status(resp: "requests.Response") -> str:
+    try:
+        body = resp.json()
+        detail = body.get("detail") if isinstance(body, dict) else None
+        if detail:
+            return str(detail)
+    except (ValueError, AttributeError):
+        pass
+    return f"HTTP {resp.status_code}"
+
+
 def api_get(path: str, **params) -> dict:
     try:
         resp = requests.get(
@@ -205,9 +206,23 @@ def api_get(path: str, **params) -> dict:
         )
     except requests.exceptions.ConnectionError:
         raise APIError(f"Cannot connect to {API_BASE_URL}")
-    if resp.status_code in (401, 403):
-        raise APIError(resp.json().get("detail", f"HTTP {resp.status_code}"))
-    resp.raise_for_status()
+    if not resp.ok:
+        raise APIError(_detail_or_status(resp))
+    return resp.json()
+
+
+def _public_get(path: str, **params) -> dict:
+    """GET a public endpoint without sending user auth/session headers."""
+    try:
+        resp = requests.get(
+            f"{API_BASE_URL}{path}",
+            params={k: v for k, v in params.items() if v is not None},
+            timeout=(5, 60),
+        )
+    except requests.exceptions.ConnectionError:
+        raise APIError(f"Cannot connect to {API_BASE_URL}")
+    if not resp.ok:
+        raise APIError(_detail_or_status(resp))
     return resp.json()
 
 
@@ -222,27 +237,42 @@ def fmt_size(n: int | float) -> str:
     return f"{n:.1f} TB"
 
 
-def fmt_tokens(n: int | float) -> str:
-    n = float(n or 0)
-    if n >= 1_000_000_000:
-        return f"{n / 1_000_000_000:.1f}B"
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.0f}K"
-    return str(int(n)) if n else "-"
-
-
 def _truncate(s: str, n: int) -> str:
     s = s or ""
     return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _display_name(b: dict) -> str:
+    name = (b.get("name") or "").strip()
+    if name:
+        return name
+    slug = (b.get("slug") or "").strip()
+    return slug or "(unnamed)"
+
+
+def _bundle_price(b: dict | None) -> int:
+    try:
+        return max(1, int((b or {}).get("price_api_keys") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _fmt_count(n: int | float) -> str:
+    n = float(n or 0)
+    if n < 1000:
+        return str(int(n))
+    for unit in ("K", "M", "B", "T"):
+        n /= 1000
+        if n < 1000:
+            return f"{n:.1f}{unit}"
+    return f"{n:.1f}T"
 
 
 # ── Bundle browsing ──────────────────────────────────────────────────────────
 
 def load_bundles(search: str | None = None) -> list[dict]:
     """Always fetches fresh — no client-side cache."""
-    data = api_get("/api/bundles")
+    data = _public_get("/api/bundles")
     bundles = data.get("bundles", [])
     if not search:
         return bundles
@@ -262,77 +292,58 @@ def load_bundles(search: str | None = None) -> list[dict]:
     return out
 
 
-def exclude_bundles(bundles: list[dict], terms: list[str]) -> list[dict]:
-    """Remove bundles whose metadata contains any of the given terms."""
-    if not terms:
-        return bundles
-    lower_terms = [t.lower().strip() for t in terms if t.strip()]
-    out = []
-    for b in bundles:
-        hay = " ".join(
-            [
-                str(b.get("name") or ""),
-                str(b.get("slug") or ""),
-                str(b.get("description") or ""),
-                " ".join(b.get("keywords") or []),
-            ]
-        ).lower()
-        if not any(t in hay for t in lower_terms):
-            out.append(b)
-    return out
-
-
 def render_bundle_table(bundles: list[dict]) -> None:
     table = Table(box=box.SIMPLE_HEAVY, show_lines=False, expand=True)
     table.add_column("#", style="dim", width=3, justify="right")
     table.add_column("Name", style="bold")
+    table.add_column("Slug", style="dim", width=18, overflow="ellipsis")
     table.add_column("Files", justify="right", width=6)
     table.add_column("Size", justify="right", width=10)
-    table.add_column("~Tokens", justify="right", width=9)
-    table.add_column("Price", justify="right", width=8)
+    table.add_column("Credits", justify="right", width=8)
+    table.add_column("Status", justify="right", width=10)
     table.add_column("Bio", overflow="fold")
     for idx, b in enumerate(bundles, start=1):
         size = b.get("total_size_approx") or 0
-        tokens = b.get("total_tokens_approx") or 0
         table.add_row(
             str(idx),
-            _truncate(b.get("name") or b.get("slug") or "(unnamed)", 40),
+            _truncate(_display_name(b), 36),
+            (b.get("slug") or "").strip() or "-",
             str(b.get("file_count") or 0),
             fmt_size(size) if size else "-",
-            fmt_tokens(tokens),
-            f"${b.get('price_api_keys') or 0}",
-            _truncate(b.get("description") or "", 70),
+            str(_bundle_price(b)),
+            "ready" if b.get("downloadable", (b.get("file_count") or 0) > 0) else "syncing",
+            _truncate(b.get("description") or "", 60),
         )
     console.print(table)
 
 
-def render_bundle_detail(slug: str) -> dict | None:
-    bundle = api_get(f"/api/bundles/{slug}")
-    summary = api_get(f"/api/bundles/{slug}/datasets")
-    files_resp = api_get(f"/api/bundles/{slug}/files", offset=0, limit=200)
+def render_bundle_detail(slug: str, prefetched: dict | None = None) -> dict | None:
+    bundle = prefetched or _public_get(f"/api/bundles/{slug}")
+    summary = _public_get(f"/api/bundles/{slug}/datasets")
+    files_resp = _public_get(f"/api/bundles/{slug}/files", offset=0, limit=200)
 
     header = Panel(
-        f"[bold cyan]{bundle.get('name') or slug}[/bold cyan]\n\n"
+        f"[bold cyan]{_display_name(bundle)}[/bold cyan]\n\n"
         f"[white]{bundle.get('description') or '(no description)'}[/white]\n\n"
         f"[dim]use case:[/dim] {bundle.get('use_case') or '-'}\n"
         f"[dim]models:[/dim] {', '.join(bundle.get('recommended_models') or []) or '-'}\n"
         f"[dim]keywords:[/dim] {', '.join(bundle.get('keywords') or []) or '-'}\n\n"
         f"[bold]{summary.get('dataset_count') or 0}[/bold] files · "
         f"[bold]{fmt_size(summary.get('total_size_bytes') or 0)}[/bold] · "
-        f"≈[bold]{summary.get('total_tokens_approx') or 0:,}[/bold] tokens",
+        f"~[bold]{_fmt_count(summary.get('total_tokens_approx') or 0)}[/bold] tokens\n"
+        f"[dim]price:[/dim] {_bundle_price(bundle)} credits",
         title=f"Bundle {slug}",
         border_style="cyan",
     )
     console.print(header)
 
-    files = files_resp.get("files") or []
     table = Table(box=box.SIMPLE, show_lines=False, expand=True)
     table.add_column("#", style="dim", width=4, justify="right")
     table.add_column("File", style="bold")
     table.add_column("Size", justify="right", width=10)
     table.add_column("License", width=14)
     table.add_column("Bio", overflow="fold")
-    for idx, f in enumerate(files, start=1):
+    for idx, f in enumerate(files_resp.get("files") or [], start=1):
         table.add_row(
             str(idx),
             _truncate(f.get("name") or "(unnamed)", 50),
@@ -343,18 +354,88 @@ def render_bundle_detail(slug: str) -> dict | None:
     console.print(table)
     if files_resp.get("has_more"):
         console.print(f"[dim]…{files_resp.get('total') or 0} files total — showing first 200[/dim]")
-
-    # File-type summary
-    ext_counts: Counter = Counter()
-    for f in files:
-        name = f.get("name") or ""
-        ext = Path(name).suffix.lower() or "(no ext)"
-        ext_counts[ext] += 1
-    if ext_counts:
-        parts = ", ".join(f"[bold]{cnt}[/bold] × {ext}" for ext, cnt in ext_counts.most_common())
-        console.print(f"[dim]Formats: {parts}[/dim]\n")
-
     return bundle
+
+
+def parse_bundle_selection(selection: str, bundles: list[dict]) -> tuple[list[dict], list[str]]:
+    """Resolve a comma/space-separated selection into bundle dicts.
+
+    Supports 1-based indexes, index ranges like "2-5", exact slugs, and
+    unambiguous slug prefixes. The returned bundle list is de-duplicated while
+    preserving selection order.
+    """
+    selected: list[dict] = []
+    seen: set[str] = set()
+    errors: list[str] = []
+    tokens = selection.replace(",", " ").replace(";", " ").split()
+
+    def add_bundle(bundle: dict) -> None:
+        slug = (bundle.get("slug") or "").strip()
+        key = slug or _display_name(bundle)
+        if key and key not in seen:
+            selected.append(bundle)
+            seen.add(key)
+
+    for token in tokens:
+        if "-" in token:
+            left, sep, right = token.partition("-")
+            if sep and left.isdigit() and right.isdigit():
+                start, end = int(left), int(right)
+                step = 1 if start <= end else -1
+                for idx in range(start, end + step, step):
+                    if 1 <= idx <= len(bundles):
+                        add_bundle(bundles[idx - 1])
+                    else:
+                        errors.append(f"{idx} is out of range")
+                continue
+
+        if token.isdigit():
+            idx = int(token)
+            if 1 <= idx <= len(bundles):
+                add_bundle(bundles[idx - 1])
+            else:
+                errors.append(f"{idx} is out of range")
+            continue
+
+        needle = token.lower()
+        exact = [
+            b for b in bundles
+            if (b.get("slug") or "").strip().lower() == needle
+        ]
+        matches = exact or [
+            b for b in bundles
+            if (b.get("slug") or "").strip().lower().startswith(needle)
+        ]
+        if len(matches) == 1:
+            add_bundle(matches[0])
+        elif len(matches) > 1:
+            errors.append(f"{token} is ambiguous ({len(matches)} matches)")
+        else:
+            errors.append(f"{token} did not match a bundle")
+
+    return selected, errors
+
+
+def render_download_summary(bundles: list[dict]) -> None:
+    table = Table(box=box.SIMPLE, show_lines=False)
+    table.add_column("#", style="dim", justify="right")
+    table.add_column("Bundle", style="bold")
+    table.add_column("Slug", style="dim")
+    table.add_column("Credits", justify="right")
+    table.add_column("Status", justify="right")
+    for idx, bundle in enumerate(bundles, start=1):
+        ready = bundle.get("downloadable", (bundle.get("file_count") or 0) > 0)
+        table.add_row(
+            str(idx),
+            _truncate(_display_name(bundle), 40),
+            (bundle.get("slug") or "").strip() or "-",
+            str(_bundle_price(bundle)),
+            "ready" if ready else "syncing",
+        )
+    console.print(table)
+    total = sum(_bundle_price(b) for b in bundles)
+    credit_word = "credit" if total == 1 else "credits"
+    console.print(f"[bold]Maximum charge if all downloads start: {total} {credit_word}.[/bold]")
 
 
 # ── Download ─────────────────────────────────────────────────────────────────
@@ -379,53 +460,64 @@ def _show_quality_report(zip_path: Path) -> None:
         pass  # silently skip if zip is partial or report is missing
 
 
-def download_bundle(slug: str, output_dir: Path, max_bytes: int | None = None) -> bool:
+def download_bundle(slug: str, output_dir: Path, price: int = 1, *, confirm: bool = True) -> bool:
     output_dir.mkdir(parents=True, exist_ok=True)
     target = output_dir / f"{slug}.zip"
-    partial = output_dir / f"{slug}.zip.partial"
-
-    # Resume support: check for an existing partial download
-    resume_from = 0
-    if partial.exists():
-        resume_from = partial.stat().st_size
-        if resume_from > 0:
-            if Confirm.ask(
-                f"[yellow]Partial download found ({fmt_size(resume_from)}). Resume?[/yellow]",
-                default=True,
-            ):
-                console.print(f"[dim]Resuming from byte {resume_from:,}[/dim]")
-            else:
-                resume_from = 0
-                partial.unlink()
-    elif target.exists():
+    if target.exists():
         if not Confirm.ask(f"[yellow]{target.name} already exists. Overwrite?[/yellow]", default=False):
             return False
 
+    price = max(1, int(price or 1))
+    credit_word = "credit" if price == 1 else "credits"
     console.print(
-        f"\n[bold]Charging 1 API credit.[/bold] "
+        f"\n[bold]This download will cost {price} {credit_word}.[/bold] "
         f"Each download is charged separately, even repeats."
     )
+    if confirm and not Confirm.ask("Proceed?", default=True):
+        return False
+
+    if not ensure_authenticated() or not acquire_session():
+        return False
+
     console.print(
         "[dim]Data is scrubbed in transit — PII, toxicity, language, quality, and bias "
         "filters all run server-side before the zip reaches you.[/dim]"
     )
     console.print("[dim]Download may be slower than raw network speed during cleaning.[/dim]\n")
 
-    req_headers = {**_auth_headers()}
-    if resume_from:
-        req_headers["Range"] = f"bytes={resume_from}-"
-
     try:
         resp = requests.get(
             f"{API_BASE_URL}/api/tui/download-bundle",
             params={"slug": slug},
-            headers=req_headers,
+            headers=_auth_headers(),
             stream=True,
             timeout=(10, None),
         )
     except requests.exceptions.ConnectionError:
         console.print(f"[red]Cannot connect to {API_BASE_URL}[/red]")
         return False
+
+    if resp.status_code == 401:
+        global _session_token
+        try:
+            resp.close()
+        except Exception:
+            pass
+        console.print("[yellow]Session expired. Re-authenticating...[/yellow]")
+        _session_token = ""
+        if not acquire_session():
+            return False
+        try:
+            resp = requests.get(
+                f"{API_BASE_URL}/api/tui/download-bundle",
+                params={"slug": slug},
+                headers=_auth_headers(),
+                stream=True,
+                timeout=(10, None),
+            )
+        except requests.exceptions.ConnectionError:
+            console.print(f"[red]Cannot connect to {API_BASE_URL}[/red]")
+            return False
 
     if resp.status_code == 403:
         try:
@@ -437,25 +529,14 @@ def download_bundle(slug: str, output_dir: Path, max_bytes: int | None = None) -
             console.print("[dim]Top up at https://neurvance.com[/dim]")
         return False
     if resp.status_code == 404:
-        console.print(f"[red]Bundle not found: {slug}[/red]")
+        console.print(f"[red]Bundle is not downloadable yet: {slug}[/red]")
         return False
-    if resp.status_code not in (200, 206):
+    if resp.status_code != 200:
         console.print(f"[red]HTTP {resp.status_code}: {resp.text[:200]}[/red]")
         return False
 
     remaining = resp.headers.get("X-Calls-Remaining")
-    content_length = int(resp.headers.get("Content-Length") or 0)
-    # For a resumed download, total is bytes already downloaded + remaining content
-    total = resume_from + content_length if content_length else 0
-
-    # GB cap check — compare against full bundle size
-    if max_bytes and total and total > max_bytes:
-        console.print(
-            f"[yellow]Bundle is {fmt_size(total)} — exceeds your {fmt_size(max_bytes)} limit.[/yellow]"
-        )
-        if not Confirm.ask("Download anyway?", default=False):
-            resp.close()
-            return False
+    total = int(resp.headers.get("Content-Length") or 0)
 
     progress = Progress(
         TextColumn("[bold blue]{task.fields[name]}", justify="right"),
@@ -465,18 +546,11 @@ def download_bundle(slug: str, output_dir: Path, max_bytes: int | None = None) -
         TimeRemainingColumn(),
         console=console,
     )
-    bytes_written = resume_from
-    file_mode = "ab" if resume_from else "wb"
-    write_path = partial  # always write to .partial, rename on success
+    bytes_written = 0
     try:
         with progress:
-            task = progress.add_task(
-                "download",
-                name=f"{slug}.zip",
-                total=total or None,
-                completed=resume_from,
-            )
-            with write_path.open(file_mode) as fh:
+            task = progress.add_task("download", name=f"{slug}.zip", total=total or None)
+            with target.open("wb") as fh:
                 for chunk in resp.iter_content(chunk_size=1024 * 1024):
                     if not chunk:
                         continue
@@ -484,10 +558,7 @@ def download_bundle(slug: str, output_dir: Path, max_bytes: int | None = None) -
                     bytes_written += len(chunk)
                     progress.update(task, advance=len(chunk))
     except KeyboardInterrupt:
-        console.print(
-            f"\n[yellow]Download interrupted — partial file kept at {partial}[/yellow]\n"
-            "[dim]Re-run the same command to resume.[/dim]"
-        )
+        console.print("\n[yellow]Download interrupted; partial file kept at " + str(target) + "[/yellow]")
         return False
     except Exception as exc:
         console.print(f"[red]Stream failed: {exc}[/red]")
@@ -497,11 +568,6 @@ def download_bundle(slug: str, output_dir: Path, max_bytes: int | None = None) -
             resp.close()
         except Exception:
             pass
-
-    # Rename .partial → .zip on successful completion
-    if target.exists():
-        target.unlink()
-    partial.rename(target)
 
     console.print(
         f"[green]Saved {fmt_size(bytes_written)} → {target}[/green]"
@@ -523,19 +589,8 @@ def _print_header() -> None:
     )
 
 
-def interactive_loop(
-    output_dir: Path,
-    max_bytes: int | None = None,
-    exclude_terms: list[str] | None = None,
-    manifest_only: bool = False,
-) -> None:
+def interactive_loop(output_dir: Path) -> None:
     _print_header()
-    if not ensure_authenticated():
-        return
-    if not acquire_session():
-        return
-
-    active_exclusions: list[str] = list(exclude_terms or [])
 
     while True:
         console.print()
@@ -545,34 +600,20 @@ def interactive_loop(
             console.print(f"[red]{exc}[/red]")
             return
 
-        if active_exclusions:
-            bundles = exclude_bundles(bundles, active_exclusions)
-            console.print(f"[dim]Excluding keywords: {', '.join(active_exclusions)}[/dim]")
-
         if not bundles:
             console.print("[yellow]No bundles available.[/yellow]")
             return
 
         render_bundle_table(bundles)
-
-        hint_parts = [
-            "Pick a bundle by number",
-            "type [bold]search <term>[/bold] to filter",
-            "type [bold]exclude <term>[/bold] to hide bundles",
-            "[bold]q[/bold] to quit",
-        ]
-        console.print("\n[dim]" + ", ".join(hint_parts) + ".[/dim]")
+        console.print(
+            "\n[dim]Pick one or more bundles by number/slug (examples: [bold]1[/bold], "
+            "[bold]1,3[/bold], [bold]1-3[/bold]), type [bold]search <term>[/bold] "
+            "to filter, or [bold]q[/bold] to quit.[/dim]"
+        )
         choice = Prompt.ask("›", default="").strip()
 
         if not choice or choice.lower() in ("q", "quit", "exit"):
             return
-
-        if choice.lower().startswith("exclude"):
-            term = choice[7:].strip() or Prompt.ask("Exclude term").strip()
-            if term:
-                active_exclusions.append(term)
-                console.print(f"[dim]Now excluding: {', '.join(active_exclusions)}[/dim]")
-            continue
 
         if choice.lower().startswith("search"):
             term = choice[6:].strip() or Prompt.ask("Search term").strip()
@@ -581,43 +622,59 @@ def interactive_loop(
             except APIError as exc:
                 console.print(f"[red]{exc}[/red]")
                 continue
-            results = exclude_bundles(results, active_exclusions)
             if not results:
                 console.print(f"[yellow]No bundles match '{term}'.[/yellow]")
                 continue
             render_bundle_table(results)
-            sub = Prompt.ask("Pick #", default="").strip()
-            if not sub.isdigit():
+            sub = Prompt.ask("Pick #/slug(s)", default="").strip()
+            picked, errors = parse_bundle_selection(sub, results)
+            for err in errors:
+                console.print(f"[yellow]{err}[/yellow]")
+            if not picked:
                 continue
-            idx = int(sub)
-            if idx < 1 or idx > len(results):
-                continue
-            slug = results[idx - 1].get("slug") or ""
-        elif choice.isdigit():
-            idx = int(choice)
-            if idx < 1 or idx > len(bundles):
-                continue
-            slug = bundles[idx - 1].get("slug") or ""
         else:
+            picked, errors = parse_bundle_selection(choice, bundles)
+            for err in errors:
+                console.print(f"[yellow]{err}[/yellow]")
+            if not picked:
+                continue
+
+        ready = [b for b in picked if b.get("downloadable", (b.get("file_count") or 0) > 0)]
+        skipped = [b for b in picked if b not in ready]
+        for b in skipped:
+            console.print(
+                f"[yellow]Skipping {_display_name(b)} - no files are assigned yet.[/yellow]"
+            )
+        if not ready:
             continue
 
-        if not slug:
-            continue
-
-        try:
-            render_bundle_detail(slug)
-        except APIError as exc:
-            console.print(f"[red]{exc}[/red]")
-            continue
-
-        if manifest_only:
-            continue
-
-        if Confirm.ask("Download this bundle?", default=True):
+        if len(ready) == 1:
+            slug = (ready[0].get("slug") or "").strip()
+            if not slug:
+                continue
             try:
-                download_bundle(slug, output_dir, max_bytes=max_bytes)
+                bundle_meta = render_bundle_detail(slug, prefetched=ready[0])
             except APIError as exc:
                 console.print(f"[red]{exc}[/red]")
+                continue
+            if Confirm.ask("Download this bundle?", default=True):
+                try:
+                    download_bundle(slug, output_dir, price=_bundle_price(bundle_meta or ready[0]))
+                except APIError as exc:
+                    console.print(f"[red]{exc}[/red]")
+            continue
+
+        render_download_summary(ready)
+        if not Confirm.ask("Download these bundles sequentially?", default=True):
+            continue
+        for bundle in ready:
+            slug = (bundle.get("slug") or "").strip()
+            if not slug:
+                continue
+            try:
+                download_bundle(slug, output_dir, price=_bundle_price(bundle), confirm=False)
+            except APIError as exc:
+                console.print(f"[red]{slug}: {exc}[/red]")
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -626,30 +683,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Neurvance Datasite TUI — bundle browser & downloader.")
     parser.add_argument("--login", action="store_true", help="Force GitHub re-login then exit.")
     parser.add_argument("--logout", action="store_true", help="Clear stored token then exit.")
-    parser.add_argument("--bundle", metavar="SLUG", help="Download one bundle non-interactively.")
-    parser.add_argument(
-        "--bundles",
-        metavar="SLUG1,SLUG2,...",
-        help="Download multiple bundles non-interactively (comma-separated slugs).",
-    )
-    parser.add_argument(
-        "--max-gb",
-        type=float,
-        default=None,
-        metavar="N",
-        help="Warn (and confirm) before downloading a bundle larger than N GB.",
-    )
-    parser.add_argument(
-        "--exclude-keywords",
-        default=None,
-        metavar="KW1,KW2,...",
-        help="Hide bundles whose metadata contains any of these comma-separated keywords.",
-    )
-    parser.add_argument(
-        "--manifest-only",
-        action="store_true",
-        help="Show bundle file list and quality report without downloading.",
-    )
+    parser.add_argument("--bundle", metavar="SLUG", help="Download this bundle non-interactively.")
     parser.add_argument(
         "--output-dir",
         default=str(DEFAULT_OUTPUT_DIR),
@@ -670,63 +704,21 @@ def main() -> int:
         return 1
 
     out_dir = Path(args.output_dir).expanduser()
-    max_bytes = int(args.max_gb * 1024 ** 3) if args.max_gb else None
-    exclude_terms = [t.strip() for t in args.exclude_keywords.split(",") if t.strip()] if args.exclude_keywords else []
 
-    # Non-interactive single bundle
     if args.bundle:
-        if not ensure_authenticated() or not acquire_session():
-            return 1
-        if args.manifest_only:
-            try:
-                render_bundle_detail(args.bundle)
-                return 0
-            except APIError as exc:
-                console.print(f"[red]{exc}[/red]")
-                return 1
         try:
-            return 0 if download_bundle(args.bundle, out_dir, max_bytes=max_bytes) else 1
+            try:
+                bundle_info = _public_get(f"/api/bundles/{args.bundle}")
+                price = _bundle_price(bundle_info)
+            except APIError:
+                price = 1
+            return 0 if download_bundle(args.bundle, out_dir, price=price) else 1
         except APIError as exc:
             console.print(f"[red]{exc}[/red]")
             return 1
 
-    # Non-interactive multi-bundle batch
-    if args.bundles:
-        if not ensure_authenticated() or not acquire_session():
-            return 1
-        slugs = [s.strip() for s in args.bundles.split(",") if s.strip()]
-        cumulative_bytes = 0
-        ok = True
-        for slug in slugs:
-            if max_bytes and cumulative_bytes >= max_bytes:
-                console.print(
-                    f"[yellow]Reached {fmt_size(max_bytes)} limit — skipping remaining bundles.[/yellow]"
-                )
-                break
-            remaining_cap = (max_bytes - cumulative_bytes) if max_bytes else None
-            try:
-                if args.manifest_only:
-                    render_bundle_detail(slug)
-                else:
-                    success = download_bundle(slug, out_dir, max_bytes=remaining_cap)
-                    if success:
-                        zip_path = out_dir / f"{slug}.zip"
-                        if zip_path.exists():
-                            cumulative_bytes += zip_path.stat().st_size
-                    else:
-                        ok = False
-            except APIError as exc:
-                console.print(f"[red]{exc}[/red]")
-                ok = False
-        return 0 if ok else 1
-
     try:
-        interactive_loop(
-            out_dir,
-            max_bytes=max_bytes,
-            exclude_terms=exclude_terms,
-            manifest_only=args.manifest_only,
-        )
+        interactive_loop(out_dir)
     except KeyboardInterrupt:
         console.print("\n[dim]Interrupted.[/dim]")
         return 130
