@@ -1,17 +1,20 @@
-
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.server
 import json
 import os
 import socketserver
 import sys
 import threading
+import time
+import uuid
 import warnings
 import webbrowser
 import zipfile
 from pathlib import Path
+from typing import Optional
 from urllib.parse import quote as _url_quote
 
 warnings.filterwarnings(
@@ -45,6 +48,8 @@ API_BASE_URL = os.getenv("DATASITE_API_URL", "https://neurvance-bb82540cb249.her
 APP_VERSION = "2.0.0"
 DEFAULT_OUTPUT_DIR = Path.cwd() / "neurvance_downloads"
 TOKEN_FILE = Path.home() / ".datasite" / "config.json"
+BUNDLE_BUILD_POLL_INTERVAL_SEC = float(os.getenv("BUNDLE_BUILD_POLL_INTERVAL_SEC", "5"))
+VERIFY_BUNDLE_SHA256 = os.getenv("DATASITE_VERIFY_SHA256", "").lower() in {"1", "true", "yes"}
 
 _bearer_token = ""
 _session_token = ""
@@ -460,6 +465,207 @@ def _show_quality_report(zip_path: Path) -> None:
         pass  # silently skip if zip is partial or report is missing
 
 
+def _json_response(resp: "requests.Response") -> dict:
+    try:
+        body = resp.json()
+        return body if isinstance(body, dict) else {}
+    except ValueError:
+        return {"detail": resp.text[:500]}
+
+
+def _bundle_start_response(slug: str, request_id: str) -> "requests.Response":
+    return requests.post(
+        f"{API_BASE_URL}/api/tui/download-bundle/start",
+        json={"slug": slug, "request_id": request_id},
+        headers=_auth_headers(),
+        timeout=(10, 60),
+    )
+
+
+def _bundle_status_response(job_id: str) -> "requests.Response":
+    return requests.get(
+        f"{API_BASE_URL}/api/tui/download-bundle/status",
+        params={"job_id": job_id},
+        headers=_auth_headers(),
+        timeout=(10, 60),
+    )
+
+
+def _artifact_ready(payload: dict) -> bool:
+    return payload.get("status") in {"ready", "ready_with_warnings"} and bool(payload.get("url"))
+
+
+def _print_build_progress(payload: dict) -> None:
+    progress = payload.get("progress") if isinstance(payload.get("progress"), dict) else {}
+    done = int(progress.get("files_done") or 0)
+    total = int(progress.get("files_total") or 0)
+    rows = int(progress.get("rows_processed") or 0)
+    dropped = int(progress.get("rows_dropped") or 0)
+    uploaded = int(progress.get("bytes_uploaded") or 0)
+    file_part = f"{done}/{total} files" if total else "preparing files"
+    console.print(
+        f"[dim]Building bundle: {file_part}, {fmt_size(uploaded)} prepared, "
+        f"{rows:,} rows checked, {dropped:,} dropped[/dim]"
+    )
+
+
+def _wait_for_bundle_artifact(payload: dict) -> Optional[dict]:
+    while not _artifact_ready(payload):
+        status = str(payload.get("status") or "")
+        if status.startswith("failed"):
+            console.print(f"[red]{payload.get('error') or 'Bundle preparation failed.'}[/red]")
+            return None
+        job_id = payload.get("job_id")
+        if not job_id:
+            console.print("[red]Server did not return a bundle job id.[/red]")
+            return None
+        _print_build_progress(payload)
+        time.sleep(BUNDLE_BUILD_POLL_INTERVAL_SEC)
+        try:
+            resp = _bundle_status_response(str(job_id))
+        except requests.exceptions.ConnectionError:
+            console.print(f"[red]Cannot connect to {API_BASE_URL}[/red]")
+            return None
+        if resp.status_code == 401:
+            global _session_token
+            _session_token = ""
+            if not acquire_session():
+                return None
+            resp = _bundle_status_response(str(job_id))
+        payload = _json_response(resp)
+        if resp.status_code not in (200, 202):
+            console.print(f"[red]{payload.get('detail') or payload.get('error') or f'HTTP {resp.status_code}'}[/red]")
+            return None
+    return payload
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _validate_zip_download(path: Path, expected_size: int, expected_sha256: str = "") -> bool:
+    actual_size = path.stat().st_size if path.exists() else 0
+    if expected_size and actual_size != expected_size:
+        console.print(
+            f"[red]Downloaded size mismatch: expected {fmt_size(expected_size)}, got {fmt_size(actual_size)}[/red]"
+        )
+        return False
+    if VERIFY_BUNDLE_SHA256 and expected_sha256:
+        actual_hash = _sha256_file(path)
+        if actual_hash.lower() != expected_sha256.lower():
+            console.print("[red]Downloaded file failed SHA-256 verification.[/red]")
+            return False
+    try:
+        with zipfile.ZipFile(path) as zf:
+            if not zf.infolist():
+                console.print("[red]Downloaded ZIP has no entries.[/red]")
+                return False
+    except zipfile.BadZipFile:
+        console.print("[red]Downloaded file is not a complete ZIP archive.[/red]")
+        return False
+    return True
+
+
+def _download_ready_artifact(payload: dict, target: Path) -> bool:
+    expected_size = int(payload.get("size") or 0)
+    expected_sha256 = str(payload.get("sha256") or "")
+    job_id = str(payload.get("job_id") or "")
+    url = str(payload.get("url") or "")
+    partial = target.with_name(target.name + ".partial")
+
+    for attempt in range(1, 6):
+        if not url:
+            console.print("[red]Server did not return a download URL.[/red]")
+            return False
+        resume_at = partial.stat().st_size if partial.exists() else 0
+        headers = {"Range": f"bytes={resume_at}-"} if resume_at else {}
+        try:
+            resp = requests.get(url, stream=True, headers=headers, timeout=(10, None))
+        except requests.exceptions.ConnectionError:
+            console.print("[yellow]Download connection dropped; refreshing URL and retrying.[/yellow]")
+            resp = None
+
+        if resp is None or resp.status_code in (403, 404):
+            if job_id:
+                status_resp = _bundle_status_response(job_id)
+                payload = _json_response(status_resp)
+                if _artifact_ready(payload):
+                    url = str(payload.get("url") or "")
+                    continue
+            return False
+
+        if resume_at and resp.status_code == 206:
+            mode = "ab"
+            initial = resume_at
+        elif resp.status_code == 200:
+            mode = "wb"
+            initial = 0
+        elif resp.status_code == 416:
+            partial.unlink(missing_ok=True)
+            continue
+        else:
+            console.print(f"[red]Artifact download failed: HTTP {resp.status_code}[/red]")
+            return False
+
+        total = expected_size or (int(resp.headers.get("Content-Length") or 0) + initial)
+        bytes_written = initial
+        progress = Progress(
+            TextColumn("[bold blue]{task.fields[name]}", justify="right"),
+            BarColumn(bar_width=None),
+            DownloadColumn(),
+            TransferSpeedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+        )
+        try:
+            with progress:
+                task = progress.add_task("download", name=target.name, total=total or None)
+                if initial:
+                    progress.update(task, completed=initial)
+                with partial.open(mode) as fh:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if not chunk:
+                            continue
+                        fh.write(chunk)
+                        bytes_written += len(chunk)
+                        progress.update(task, advance=len(chunk))
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Download interrupted; partial file kept at " + str(partial) + "[/yellow]")
+            return False
+        except Exception as exc:
+            console.print(f"[yellow]Download stream failed on attempt {attempt}: {exc}[/yellow]")
+            continue
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+        if expected_size and bytes_written < expected_size:
+            console.print("[yellow]Download ended early; refreshing URL and resuming.[/yellow]")
+            if job_id:
+                status_resp = _bundle_status_response(job_id)
+                payload = _json_response(status_resp)
+                url = str(payload.get("url") or url)
+            continue
+
+        if not _validate_zip_download(partial, expected_size, expected_sha256):
+            partial.unlink(missing_ok=True)
+            return False
+        partial.replace(target)
+        warnings_count = int(payload.get("warnings") or 0)
+        if warnings_count:
+            console.print(f"[yellow]Saved with {warnings_count} upstream warning file(s) included.[/yellow]")
+        return True
+
+    console.print("[red]Download failed after multiple resume attempts.[/red]")
+    return False
+
+
 def download_bundle(slug: str, output_dir: Path, price: int = 1, *, confirm: bool = True) -> bool:
     output_dir.mkdir(parents=True, exist_ok=True)
     target = output_dir / f"{slug}.zip"
@@ -485,14 +691,9 @@ def download_bundle(slug: str, output_dir: Path, price: int = 1, *, confirm: boo
     )
     console.print("[dim]Download may be slower than raw network speed during cleaning.[/dim]\n")
 
+    request_id = str(uuid.uuid4())
     try:
-        resp = requests.get(
-            f"{API_BASE_URL}/api/tui/download-bundle",
-            params={"slug": slug},
-            headers=_auth_headers(),
-            stream=True,
-            timeout=(10, None),
-        )
+        resp = _bundle_start_response(slug, request_id)
     except requests.exceptions.ConnectionError:
         console.print(f"[red]Cannot connect to {API_BASE_URL}[/red]")
         return False
@@ -508,66 +709,36 @@ def download_bundle(slug: str, output_dir: Path, price: int = 1, *, confirm: boo
         if not acquire_session():
             return False
         try:
-            resp = requests.get(
-                f"{API_BASE_URL}/api/tui/download-bundle",
-                params={"slug": slug},
-                headers=_auth_headers(),
-                stream=True,
-                timeout=(10, None),
-            )
+            resp = _bundle_start_response(slug, request_id)
         except requests.exceptions.ConnectionError:
             console.print(f"[red]Cannot connect to {API_BASE_URL}[/red]")
             return False
 
+    payload = _json_response(resp)
     if resp.status_code == 403:
-        try:
-            detail = resp.json().get("detail", "Forbidden.")
-        except ValueError:
-            detail = resp.text
+        detail = payload.get("detail") or payload.get("error") or "Forbidden."
         console.print(f"[red]{detail}[/red]")
         if "remaining" in str(detail).lower():
             console.print("[dim]Top up at https://neurvance.com[/dim]")
         return False
     if resp.status_code == 404:
-        console.print(f"[red]Bundle is not downloadable yet: {slug}[/red]")
+        detail = payload.get("detail") or payload.get("error") or ""
+        console.print(f"[red]Bundle is not downloadable yet: {slug} ({detail or 'no detail'})[/red]")
         return False
-    if resp.status_code != 200:
-        console.print(f"[red]HTTP {resp.status_code}: {resp.text[:200]}[/red]")
+    if resp.status_code not in (200, 202):
+        console.print(f"[red]{payload.get('detail') or payload.get('error') or f'HTTP {resp.status_code}'}[/red]")
         return False
 
-    remaining = resp.headers.get("X-Calls-Remaining")
-    total = int(resp.headers.get("Content-Length") or 0)
+    if not _artifact_ready(payload):
+        console.print("[cyan]Preparing cleaned ZIP on the server. This can take a while for large bundles.[/cyan]")
+        payload = _wait_for_bundle_artifact(payload)
+        if not payload:
+            return False
 
-    progress = Progress(
-        TextColumn("[bold blue]{task.fields[name]}", justify="right"),
-        BarColumn(bar_width=None),
-        DownloadColumn(),
-        TransferSpeedColumn(),
-        TimeRemainingColumn(),
-        console=console,
-    )
-    bytes_written = 0
-    try:
-        with progress:
-            task = progress.add_task("download", name=f"{slug}.zip", total=total or None)
-            with target.open("wb") as fh:
-                for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                    if not chunk:
-                        continue
-                    fh.write(chunk)
-                    bytes_written += len(chunk)
-                    progress.update(task, advance=len(chunk))
-    except KeyboardInterrupt:
-        console.print("\n[yellow]Download interrupted; partial file kept at " + str(target) + "[/yellow]")
+    remaining = payload.get("calls_remaining")
+    if not _download_ready_artifact(payload, target):
         return False
-    except Exception as exc:
-        console.print(f"[red]Stream failed: {exc}[/red]")
-        return False
-    finally:
-        try:
-            resp.close()
-        except Exception:
-            pass
+    bytes_written = target.stat().st_size if target.exists() else 0
 
     console.print(
         f"[green]Saved {fmt_size(bytes_written)} → {target}[/green]"
