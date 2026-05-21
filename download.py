@@ -11,7 +11,7 @@ import uuid
 import webbrowser
 import zipfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 try:
     import requests
@@ -26,12 +26,21 @@ except ImportError:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-BASE_URL = os.environ.get("NEURVANCE_URL", "https://neurvance-bb82540cb249.herokuapp.com").rstrip("/")
+DEFAULT_API_BASE_URL = "https://neurvancebackend-f7utq.ondigitalocean.app"
+DEFAULT_AUTH_BASE_URL = "https://neurvance.com"
+BASE_URL = os.environ.get("NEURVANCE_URL", DEFAULT_API_BASE_URL).rstrip("/")
+AUTH_BASE_URL = os.environ.get("NEURVANCE_AUTH_URL", DEFAULT_AUTH_BASE_URL).rstrip("/")
 API_MIN_INTERVAL = max(0.0, float(os.environ.get("NEURVANCE_API_MIN_INTERVAL", "5")))
 DOWNLOAD_CHUNK = 1024 * 1024  # 1 MB
 SESSION_CACHE_PATH = os.path.join(os.path.expanduser("~"), ".neurvance", "session.json")
 SESSION_MAX_AGE = 8 * 3600  # 8 hours
 _last_api_request_at = 0.0
+SUPABASE_REDIRECT_CONFIG_MESSAGE = (
+    "Supabase is redirecting to neurvance.com. Add the DigitalOcean callback URL "
+    "to Supabase Auth Redirect URLs: "
+    "https://neurvancebackend-f7utq.ondigitalocean.app/auth/callback and "
+    "https://neurvancebackend-f7utq.ondigitalocean.app/auth/callback**"
+)
 
 OAUTH_CALLBACK_PORT = 8765
 
@@ -67,6 +76,17 @@ def _parse_args():
                    help="Parallel download workers (default: 8; requires server Range support)")
     p.add_argument("--no-parallel", action="store_true", help="Force single-threaded serial download")
     p.add_argument("--quiet", "-q", action="store_true", help="Suppress non-essential output")
+    rag_group = p.add_argument_group("RAG / search")
+    rag_group.add_argument("--rag", metavar="QUERY",
+                           help="Query bundle knowledge index and print snippets (requires login)")
+    rag_group.add_argument("--rag-top-k", type=int, default=5, metavar="N", dest="rag_top_k",
+                           help="Number of bundle RAG results to return (default: 5)")
+    rag_group.add_argument("--reindex", action="store_true",
+                           help="Trigger a full bundle knowledge reindex and exit")
+    rag_group.add_argument("--cc0", metavar="QUERY",
+                           help="Search CC0 public sources via Content API (no login required; needs --key)")
+    rag_group.add_argument("--key", metavar="APIKEY",
+                           help="API key for --cc0 (or set CC0_CONTENT_API_KEY env var)")
     return p.parse_args()
 
 
@@ -88,10 +108,50 @@ def _log(msg, quiet=False, **kwargs):
         print(msg, **kwargs)
 
 
+def _is_cloudflare_challenge(resp):
+    text = (getattr(resp, "text", "") or "")[:4096].lower()
+    headers = getattr(resp, "headers", {}) or {}
+    server = headers.get("server", "").lower()
+    content_type = headers.get("content-type", "").lower()
+    status_code = int(getattr(resp, "status_code", 0) or 0)
+    return (
+        "just a moment" in text
+        or "/cdn-cgi/challenge-platform/" in text
+        or "enable javascript and cookies to continue" in text
+        or (
+            "cloudflare" in server
+            and status_code in (403, 503)
+            and ("text/html" in content_type or "<html" in text)
+        )
+    )
+
+
+def _response_detail(resp):
+    if _is_cloudflare_challenge(resp):
+        return (
+            "Cloudflare challenged this API request before it reached Neurvance. "
+            f"Use the direct DigitalOcean API host: {DEFAULT_API_BASE_URL} "
+            "(or set NEURVANCE_URL to that value)."
+        )
+    try:
+        return resp.json().get("detail", resp.text)
+    except Exception:
+        return resp.text
+
+
+def _default_client_headers():
+    return {
+        "X-Neurvance-Client": "download-client",
+        "User-Agent": "neurvance-download-client/1.0",
+    }
+
+
 def _api(method, path, session_token=None, **kwargs):
     global _last_api_request_at
     url = f"{BASE_URL}{path}"
-    headers = kwargs.pop("headers", {})
+    headers = dict(kwargs.pop("headers", {}) or {})
+    for key, value in _default_client_headers().items():
+        headers.setdefault(key, value)
     if session_token:
         headers["X-Session-Token"] = session_token
     for attempt in range(4):
@@ -107,6 +167,61 @@ def _api(method, path, session_token=None, **kwargs):
         print(f"  Rate limited; retrying in {retry_after:.0f}s...")
         time.sleep(retry_after)
     return resp
+
+
+def _redirect_to_from_location(location):
+    if not location:
+        return ""
+    try:
+        return (parse_qs(urlparse(location).query).get("redirect_to") or [""])[0]
+    except Exception:
+        return ""
+
+
+def _validate_github_redirect_config(login_url):
+    """Best-effort preflight for the Supabase redirect URL allow-list."""
+    expected_callback = f"{AUTH_BASE_URL}/auth/callback"
+    if AUTH_BASE_URL == DEFAULT_AUTH_BASE_URL:
+        return
+    try:
+        login_resp = requests.get(
+            login_url,
+            allow_redirects=False,
+            timeout=15,
+            headers=_default_client_headers(),
+        )
+    except requests.RequestException:
+        return
+
+    if _is_cloudflare_challenge(login_resp):
+        sys.exit(f"  Browser login preflight failed: {_response_detail(login_resp)}")
+
+    supabase_location = login_resp.headers.get("Location", "")
+    if not supabase_location:
+        return
+
+    try:
+        supabase_resp = requests.get(
+            supabase_location,
+            allow_redirects=False,
+            timeout=15,
+            headers={"User-Agent": "neurvance-download-client/1.0"},
+        )
+    except requests.RequestException:
+        return
+
+    provider_location = supabase_resp.headers.get("Location", "")
+    redirect_to = _redirect_to_from_location(provider_location) or _redirect_to_from_location(supabase_location)
+    if not redirect_to:
+        return
+
+    if redirect_to.startswith("https://neurvance.com/auth/callback") or not redirect_to.startswith(expected_callback):
+        sys.exit(f"  Browser login preflight failed: {SUPABASE_REDIRECT_CONFIG_MESSAGE}")
+    if "tui_state=" not in redirect_to:
+        sys.exit(
+            "  Browser login preflight failed: Supabase did not preserve the CLI state in redirect_to. "
+            "Add https://neurvancebackend-f7utq.ondigitalocean.app/auth/callback** to Supabase Auth Redirect URLs."
+        )
 
 
 def _retry_after_seconds(resp, default):
@@ -173,8 +288,12 @@ def _validate_cached_session(session_token):
 # ── Login: GitHub OAuth (browser) ─────────────────────────────────────────────
 
 def _login_github():
-    callback_url = f"http://localhost:{OAUTH_CALLBACK_PORT}/callback"
-    login_url = f"{BASE_URL}/auth/github/login?tui_redirect={callback_url}"
+    callback_url = f"http://127.0.0.1:{OAUTH_CALLBACK_PORT}/callback"
+    login_url = f"{AUTH_BASE_URL}/auth/github/login?tui_redirect={quote(callback_url, safe='')}"
+
+    print("  Checking GitHub redirect configuration...", end=" ", flush=True)
+    _validate_github_redirect_config(login_url)
+    print("OK")
 
     received = {}
     server_done = threading.Event()
@@ -185,7 +304,16 @@ def _login_github():
             if parsed.path == "/callback":
                 params = parse_qs(parsed.query)
                 received["token"] = (params.get("token") or [""])[0]
-                body = b"<html><body><h2>Login successful! You can close this tab.</h2></body></html>"
+                received["error"] = (params.get("error") or [""])[0]
+                received["message"] = (params.get("message") or [""])[0]
+                if received["error"]:
+                    body = (
+                        "<html><body><h2>Login needs attention</h2>"
+                        f"<p>{received['message'] or received['error']}</p>"
+                        "</body></html>"
+                    ).encode("utf-8")
+                else:
+                    body = b"<html><body><h2>Login successful! You can close this tab.</h2></body></html>"
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html")
                 self.send_header("Content-Length", str(len(body)))
@@ -219,20 +347,23 @@ def _login_github():
     server_done.wait(timeout=120)
 
     bearer = received.get("token", "")
+    if received.get("error"):
+        print("FAILED")
+        detail = received.get("message") or received.get("error")
+        sys.exit(f"  Browser login error: {detail}")
     if not bearer:
         print("TIMED OUT")
-        sys.exit("  Browser login did not complete. Try again or use email login.")
+        sys.exit(
+            "  Browser login did not complete. Try again or use email login.\n"
+            f"  If your browser showed https://neurvance.com/auth/callback?code=..., {SUPABASE_REDIRECT_CONFIG_MESSAGE}"
+        )
 
     print("OK")
     print("  Creating session…", end=" ", flush=True)
     resp = _api("POST", "/api/tui/session", headers={"Authorization": f"Bearer {bearer}"})
     if resp.status_code != 200:
         print("FAILED")
-        try:
-            detail = resp.json().get("detail", resp.text)
-        except Exception:
-            detail = resp.text
-        sys.exit(f"  Session error: {detail}")
+        sys.exit(f"  Session error: {_response_detail(resp)}")
 
     data = resp.json()
     print("OK")
@@ -251,14 +382,15 @@ def _login_email():
         sys.exit("No password entered. Exiting.")
 
     print("  Signing in…", end=" ", flush=True)
-    resp = _api("POST", "/auth/email/login", json={"email": email, "password": password})
+    resp = _api(
+        "POST",
+        "/auth/email/login",
+        headers={"X-Neurvance-Client": "download-client"},
+        json={"email": email, "password": password},
+    )
     if resp.status_code != 200:
         print("FAILED")
-        try:
-            detail = resp.json().get("detail", resp.text)
-        except Exception:
-            detail = resp.text
-        sys.exit(f"  Login error: {detail}")
+        sys.exit(f"  Login error: {_response_detail(resp)}")
 
     data = resp.json()
     access_token = data.get("access_token")
@@ -271,11 +403,7 @@ def _login_email():
     resp2 = _api("POST", "/api/tui/session", headers={"Authorization": f"Bearer {access_token}"})
     if resp2.status_code != 200:
         print("FAILED")
-        try:
-            detail = resp2.json().get("detail", resp2.text)
-        except Exception:
-            detail = resp2.text
-        sys.exit(f"  Session error: {detail}")
+        sys.exit(f"  Session error: {_response_detail(resp2)}")
 
     session_data = resp2.json()
     print("OK")
@@ -310,11 +438,9 @@ def _print_bundles(bundles, quiet=False):
     for i, b in enumerate(bundles, 1):
         name = (b.get("name") or b.get("slug") or "")[:38]
         file_count = b.get("file_count") or 0
-        downloadable = b.get("downloadable", True)
+        downloadable = b.get("downloadable", file_count > 0)
         if file_count > 0:
             files = str(file_count)
-        elif downloadable:
-            files = "✓"      # has files; count not exposed by server
         else:
             files = "none"
         tok = b.get("total_tokens_approx") or 0
@@ -326,12 +452,15 @@ def _print_bundles(bundles, quiet=False):
 
 # ── Download flow ─────────────────────────────────────────────────────────────
 
-def _start_download(session_token, slug):
+def _start_download(session_token, slug, kind=None):
     req_id = str(uuid.uuid4())
+    body = {"slug": slug, "request_id": req_id}
+    if kind in ("text", "image"):
+        body["kind"] = kind
     resp = _api(
         "POST", "/api/tui/download-bundle/start",
         session_token=session_token,
-        json={"slug": slug, "request_id": req_id},
+        json=body,
     )
     if resp.status_code == 200:
         data = resp.json()
@@ -339,26 +468,31 @@ def _start_download(session_token, slug):
             return data  # cache hit — already ready
     if resp.status_code == 202:
         return resp.json()
-    try:
-        detail = resp.json().get("detail", resp.text)
-    except Exception:
-        detail = resp.text
-    sys.exit(f"  Download start failed: {detail}")
+    sys.exit(f"  Download start failed: {_response_detail(resp)}")
+
+
+_SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
 def _poll_status(session_token, job_id, quiet=False):
     delay = 2.0  # adaptive: starts fast, backs off to 10 s
+    spin_idx = 0
+    start_time = time.time()
+    last_files_done = -1
+
     while True:
-        resp = _api(
-            "GET", f"/api/tui/download-bundle/status?job_id={job_id}",
-            session_token=session_token,
-        )
+        try:
+            resp = _api(
+                "GET", f"/api/tui/download-bundle/status?job_id={job_id}",
+                session_token=session_token,
+            )
+        except requests.exceptions.ConnectionError:
+            if not quiet:
+                print(f"\r  ⚠ Server unreachable, retrying…{' ' * 20}", end="", flush=True)
+            time.sleep(10)
+            continue
         if resp.status_code not in (200, 202):
-            try:
-                detail = resp.json().get("detail", resp.text)
-            except Exception:
-                detail = resp.text
-            sys.exit(f"  Status check failed: {detail}")
+            sys.exit(f"  Status check failed: {_response_detail(resp)}")
 
         data = resp.json()
         status = data.get("status", "")
@@ -374,8 +508,28 @@ def _poll_status(session_token, job_id, quiet=False):
         prog = data.get("progress", {})
         files_done = prog.get("files_done", 0)
         files_total = prog.get("files_total", "?")
+
         if not quiet:
-            print(f"\r  Building… {files_done}/{files_total} files   ", end="", flush=True)
+            now = time.time()
+            spin = _SPINNER[spin_idx % len(_SPINNER)]
+            spin_idx += 1
+
+            elapsed = int(now - start_time)
+            elapsed_str = f"{elapsed // 60}m{elapsed % 60:02d}s"
+
+            if files_done != last_files_done:
+                last_files_done = files_done
+
+            if isinstance(files_total, int) and files_total > 0:
+                pct = int(files_done / files_total * 100)
+                bar_len = 20
+                filled = int(bar_len * files_done / files_total)
+                bar = "█" * filled + "░" * (bar_len - filled)
+                line = f"\r  {spin} [{bar}] {pct}% — {files_done}/{files_total} files  {elapsed_str}   "
+            else:
+                line = f"\r  {spin} Building… {files_done}/{files_total} files  {elapsed_str}   "
+
+            print(line, end="", flush=True)
 
         time.sleep(delay)
         delay = min(delay + 2.0, 10.0)
@@ -615,6 +769,49 @@ def _extract_zip(zip_path, output_dir, slug, quiet):
     _log(f"  Extracted: {extract_path}", quiet)
 
 
+# ── RAG / CC0 search helpers ─────────────────────────────────────────────────
+
+def _rag_query(session_token, query, top_k=5):
+    resp = _api(
+        "POST", "/api/tui/rag/query",
+        session_token=session_token,
+        json={"query": query, "top_k": top_k},
+    )
+    if resp.status_code != 200:
+        sys.exit(f"  RAG query failed: {_response_detail(resp)}")
+    return resp.json()
+
+
+def _rag_reindex(session_token):
+    resp = _api("POST", "/api/tui/rag/reindex", session_token=session_token, json={})
+    if resp.status_code != 200:
+        sys.exit(f"  Reindex failed: {_response_detail(resp)}")
+    return resp.json()
+
+
+def _cc0_search(api_key, query):
+    url = f"{BASE_URL}/api/v1/search"
+    headers = {"X-API-Key": api_key, **_default_client_headers()}
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, headers=headers, params={"query": query}, timeout=30)
+        except requests.exceptions.RequestException as exc:
+            if attempt == 2:
+                sys.exit(f"  CC0 search request failed: {exc}")
+            time.sleep(2 ** attempt)
+            continue
+        if resp.status_code != 429 or attempt == 2:
+            break
+        time.sleep(_retry_after_seconds(resp, API_MIN_INTERVAL))
+    if resp.status_code != 200:
+        try:
+            detail = resp.json().get("message") or resp.text
+        except Exception:
+            detail = resp.text
+        sys.exit(f"  CC0 search failed [{resp.status_code}]: {detail}")
+    return resp.json()
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -622,6 +819,30 @@ def main():
     quiet = args.quiet
 
     _print_banner(quiet)
+
+    # ── CC0 public-source search (no login needed, just API key) ─────────────
+    if args.cc0:
+        api_key = args.key or os.environ.get("CC0_CONTENT_API_KEY", "")
+        if not api_key:
+            sys.exit(
+                "  --cc0 requires an API key.\n"
+                "  Pass --key APIKEY or set CC0_CONTENT_API_KEY env var.\n"
+                "  Get a key at https://neurvance.com/dashboard"
+            )
+        result = _cc0_search(api_key, args.cc0)
+        chunks = result.get("chunks", [])
+        if not chunks:
+            print("  No results found.")
+        else:
+            for c in chunks:
+                print(f"\n  [{c.get('source_name', '?')}] {c.get('title', '')}")
+                print(f"  {c.get('source_url', '')}")
+                snippet = c.get("text") or ""
+                if len(snippet) > 400:
+                    snippet = snippet[:400] + "…"
+                print(f"  {snippet}")
+            _log(f"\n  {len(chunks)} result(s)  ({result.get('processing_time_ms', '?')} ms)", quiet)
+        return
 
     # ── Step 1: Login ──────────────────────────────────────────────────────────
     session_token = None
@@ -658,6 +879,22 @@ def main():
         _save_cached_session(session_token)
         _log("\n  Logged in.", quiet)
 
+    # ── Bundle RAG search ─────────────────────────────────────────────────────
+    if args.rag or args.reindex:
+        if args.rag:
+            result = _rag_query(session_token, args.rag, args.rag_top_k)
+            status = result.get("status")
+            if status == "no_match":
+                print(f"  {result.get('message', 'No relevant matches found.')}")
+            else:
+                for r in result.get("results", []):
+                    print(f"\n  [{r.get('key', '?')}]")
+                    print(f"  {r.get('snippet', '')}")
+        if args.reindex:
+            r = _rag_reindex(session_token)
+            print(f"  Reindexed: {r.get('indexed', 0)} file(s), skipped: {r.get('skipped_invalid', 0)}")
+        return
+
     # ── Step 2: Fetch bundles ──────────────────────────────────────────────────
     _log("  Fetching available bundles…", quiet)
     text_bundles, image_bundles = _list_bundles(session_token)
@@ -678,7 +915,12 @@ def main():
 
     # ── --bundle SLUG shortcut ─────────────────────────────────────────────────
     if args.bundle:
-        all_bundles = text_bundles + image_bundles
+        if args.bundle_type == "text":
+            all_bundles = text_bundles
+        elif args.bundle_type == "image":
+            all_bundles = image_bundles
+        else:
+            all_bundles = text_bundles + image_bundles
         matches = [b for b in all_bundles if b.get("slug") == args.bundle]
         if not matches:
             sys.exit(f"  Bundle '{args.bundle}' not found.")
@@ -735,7 +977,9 @@ def main():
     slug = selected.get("slug")
 
     if not selected.get("downloadable"):
-        print(f"\n  Warning: '{name}' has no files assigned yet. The download will be empty.")
+        print(f"\n  '{name}' is not yet available — files are still being indexed.")
+        print("  Please try again in a few minutes, or choose a different bundle.")
+        return
 
     print()
     if not args.yes:
@@ -746,7 +990,7 @@ def main():
 
     # ── Step 5: Start build ────────────────────────────────────────────────────
     _log("  Starting bundle build…", quiet)
-    result = _start_download(session_token, slug)
+    result = _start_download(session_token, slug, selected.get("bundle_kind"))
 
     # ── Step 6: Poll if not immediately ready ──────────────────────────────────
     if not result.get("url"):

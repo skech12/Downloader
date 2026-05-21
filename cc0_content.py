@@ -21,12 +21,11 @@ class CC0Client:
     """
     Python client for the CC0 Content API.
 
-    All content returned is verified CC0 (Creative Commons Zero).
-    No attribution required. No legal risk.
+    Supports search, source listing, and health check endpoints.
     """
 
-    # Same default as websiteFolder/config.js API_BASE (Neurvance Heroku); override with CC0_CONTENT_BASE_URL
-    DEFAULT_BASE_URL = "https://neurvance-bb82540cb249.herokuapp.com"
+    # Same default as websiteFolder/config.js API_BASE; override with CC0_CONTENT_BASE_URL.
+    DEFAULT_BASE_URL = "https://neurvancebackend-f7utq.ondigitalocean.app"
 
     def __init__(
         self,
@@ -183,6 +182,7 @@ class AsyncCC0Client:
 
     async def _request(self, method: str, path: str, **kwargs) -> dict:
         import asyncio
+        last_error = None
         for attempt in range(self.max_retries + 1):
             try:
                 resp = await self._client.request(method, path, **kwargs)
@@ -196,9 +196,16 @@ class AsyncCC0Client:
             except CC0APIError as e:
                 if e.status_code in (429, 500, 502, 503, 504) and attempt < self.max_retries:
                     await asyncio.sleep(min(0.5 * (2 ** attempt), 8))
+                    last_error = e
                     continue
                 raise
-        raise Exception("Max retries exceeded")
+            except httpx.TimeoutException as e:
+                if attempt < self.max_retries:
+                    await asyncio.sleep(min(1.0 * (2 ** attempt), 10))
+                    last_error = e
+                    continue
+                raise
+        raise last_error or Exception("Max retries exceeded")
 
     async def close(self):
         await self._client.aclose()

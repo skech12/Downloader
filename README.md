@@ -1,147 +1,199 @@
-## Currently down as we change backend structur
-
-
 # Neurvance Downloader
 
 [![License: MIT + Commons Clause](https://img.shields.io/badge/license-MIT%20%2B%20Commons%20Clause-blue.svg)](LICENSE)
-[![CC0](https://img.shields.io/badge/data-CC0%20licensed-orange)](https://creativecommons.org/publicdomain/zero/1.0/)
 
-## Curated training data, bundle downloads, and CC0 search
+Download AI training data bundles and query CC0 public-source data — all from the terminal.
 
-Neurvance provides curated, pre-cleaned datasets through a terminal downloader and a small Python client for CC0 content search. The current repository includes:
+Two tools in this repo:
 
-- `download.py` - an interactive terminal downloader for text and image bundles.
-- `cc0_content.py` - sync and async Python clients for the CC0 Content API.
-- `rag.py` - a minimal example that loads an API key from `.env` and runs a search.
+| File | What it does |
+|---|---|
+| `download.py` | Download bundles, query bundle knowledge base, search CC0 sources |
+| `cc0_content.py` | Python client for the CC0 public-source search API |
+| `rag.py` | Minimal example: load API key from `.env` and run a CC0 search |
 
-Browse bundles and subscribe at [neurvance.com](https://neurvance.com).
+API endpoint: `https://neurvancebackend-f7utq.ondigitalocean.app`
 
 ---
 
 ## Requirements
 
-- Python 3.10 or newer
-- A Neurvance account for bundle downloads
-- A `CC0_CONTENT_API_KEY` for the CC0/RAG search client
-
-Install the dependencies used by the current scripts:
+Python 3.10+. Install dependencies:
 
 ```bash
 pip install requests tqdm httpx python-dotenv
 ```
 
-`tqdm` is optional for `download.py`; without it, the downloader falls back to a simple text progress display.
+`tqdm` is optional (nicer progress bars without it the downloader falls back to plain text).
 
 ---
 
 ## Bundle Downloader
 
-Run the interactive downloader:
-
 ```bash
+# List available bundles
+python download.py --list
+
+# Filter the list
+python download.py --list --search medical
+
+# Download a specific bundle, skip prompts, auto-extract
+python download.py --bundle my-bundle-slug --yes --extract
+
+# Interactive flow (prompts for login + bundle selection)
 python download.py
 ```
 
-The downloader currently works as an interactive terminal flow:
+### Login
 
-1. Choose email/password login or GitHub browser login.
-2. The client creates a short-lived TUI session with the Neurvance API.
-3. Choose text bundles or image bundles.
-4. Pick a bundle by number and confirm the credit cost.
-5. The server builds or reuses a zip bundle.
-6. The client downloads `<bundle-slug>.zip` into the current directory and prints the SHA256 hash.
-
-The downloader uses this production API by default:
-
-```text
-https://neurvance-bb82540cb249.herokuapp.com
-```
-
-Override it for development or staging with:
+Sessions are cached for 8 hours in `~/.neurvance/session.json`.
 
 ```bash
-export NEURVANCE_URL="https://your-api.example.com"
-python download.py
+python download.py --github    # GitHub OAuth via browser
+python download.py --email     # Email / password
+python download.py --relogin   # Force re-login
 ```
 
-### Current Downloader Notes
+### How downloads work
 
-- There is no non-interactive `--bundle` or `--output-dir` mode in the current `download.py`.
-- Downloads are saved as `<slug>.zip` in the directory where you run the script.
-- GitHub login opens a local callback server on `http://localhost:8765/callback`.
-- Email login posts to `/auth/email/login`.
-- Bundle downloads use `/api/tui/download-bundle/start` and poll `/api/tui/download-bundle/status`.
+1. `POST /api/tui/download-bundle/start` — server builds or returns a cached ZIP.
+2. Poll `GET /api/tui/download-bundle/status?job_id=…` until the signed URL is ready.
+3. `HEAD` checks if the server supports `Range` requests.
+4. Downloads with parallel chunked workers (default 8) or serial stream fallback.
+5. Resumes partial downloads when the server supports ranges.
+6. SHA256-verifies the completed file.
+7. `--extract` unpacks the ZIP to `<output-dir>/<slug>/`.
 
 ---
 
-## CC0 / RAG Search
+## Bundle RAG (`--rag`)
 
-The current RAG example uses `CC0Client.search()` from `cc0_content.py`. It requires an API key.
-
-Create a `.env` file:
+Search the knowledge index built from your accessible bundles. Requires login.
 
 ```bash
-CC0_CONTENT_API_KEY=your_api_key_here
+python download.py --rag "transformer fine-tuning datasets"
+python download.py --rag "clinical trial outcomes" --rag-top-k 10
+python download.py --reindex   # rebuild the index
 ```
 
-Run the included example:
+---
+
+## CC0 Public-Source Search (`--cc0`)
+
+Search 25+ real-time public data sources filtered by CC0 license patterns.
+No login — just an API key from your [dashboard](https://neurvance.com/dashboard).
 
 ```bash
+python download.py --cc0 "impressionist paintings" --key sk-...
+
+# Or set the key as an env var
+export CC0_CONTENT_API_KEY=sk-...
+python download.py --cc0 "deep-sea organisms"
+```
+
+---
+
+## All flags
+
+| Flag | Purpose |
+|---|---|
+| `--email` / `--github` | Choose login method |
+| `--relogin` | Ignore cached session |
+| `--list` | List bundles and exit |
+| `--search TERM` | Filter bundle list |
+| `--type {text,image}` | Show only text or image bundles |
+| `--bundle SLUG` | Download a specific bundle directly |
+| `--output-dir PATH` | Save ZIP here (default `.`) |
+| `--yes` / `-y` | Skip confirmation prompts |
+| `--extract` | Unzip after download |
+| `--workers N` | Parallel download workers (default 8) |
+| `--no-parallel` | Force single-threaded download |
+| `--quiet` / `-q` | Suppress non-essential output |
+| `--rag QUERY` | Query bundle knowledge index (login required) |
+| `--rag-top-k N` | Number of RAG results (default 5) |
+| `--reindex` | Trigger bundle knowledge reindex |
+| `--cc0 QUERY` | Search CC0 public sources (API key required) |
+| `--key APIKEY` | API key for `--cc0` |
+
+## Environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `NEURVANCE_URL` | `https://neurvancebackend-f7utq.ondigitalocean.app` | API base URL |
+| `NEURVANCE_AUTH_URL` | `https://neurvance.com` | Browser OAuth start URL |
+| `NEURVANCE_API_MIN_INTERVAL` | `5` | Min seconds between API calls |
+| `CC0_CONTENT_API_KEY` | — | API key for `--cc0` and `cc0_content.py` |
+
+---
+
+## CC0 Content Client (`cc0_content.py`)
+
+A standalone Python client for the CC0 search API.
+
+### Quick example (`rag.py`)
+
+```bash
+# put CC0_CONTENT_API_KEY=your_key in a .env file
 python rag.py
 ```
 
-By default, `rag.py` searches for:
-
-```text
-history of rome
-```
-
-Edit the query in `rag.py` to try a different search.
-
-### Use The Client Directly
+### Sync usage
 
 ```python
 from cc0_content import CC0Client
 
-client = CC0Client(api_key="your_api_key_here")
-results = client.search("medical imaging classification")
-print(results["chunks"])
-client.close()
+with CC0Client(api_key="sk-...") as client:
+    result = client.search("history of rome")
+    for chunk in result["chunks"]:
+        print(chunk["title"], chunk["source_url"])
+        print(chunk["text"][:300])
 ```
 
-With environment variables:
+### Async usage
 
 ```python
-from cc0_content import CC0Client
+from cc0_content import AsyncCC0Client
 
-with CC0Client() as client:
-    results = client.search("history of rome")
-    print(results["chunks"])
+async def run():
+    async with AsyncCC0Client(api_key="sk-...") as client:
+        result = await client.search("deep sea creatures")
+        for chunk in result["chunks"]:
+            print(chunk["title"])
 ```
 
-Available client methods:
+### Methods
 
-- `search(query)` - search CC0 content chunks.
-- `list_sources()` - list available CC0 content sources.
-- `health()` - check API health.
+| Method | Description |
+|---|---|
+| `search(query)` | Search across public CC0 sources |
+| `list_sources()` | List available sources and license basis |
+| `health()` | Health check (no auth required) |
 
-Optional environment variables:
-
-```bash
-export CC0_CONTENT_API_KEY="your_api_key_here"
-export CC0_CONTENT_BASE_URL="https://your-api.example.com"
-```
-
-An async client is also available as `AsyncCC0Client`.
+Each result chunk contains: `text`, `title`, `source_url`, `source_name`,
+`license`, `license_url`, `content_type`, `relevance_score`, `metadata`,
+`commercial_use_verified`, `jurisdiction_note`, `verification_confidence`.
 
 ---
 
 ## Dataset Catalog
 
-See [DATASETS.md](DATASETS.md) for the dataset catalog organized by domain.
+See [DATASETS.md](DATASETS.md) for the full catalog organized by domain.
+
+---
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `Rate limited; retrying in Ns…` | Increase `NEURVANCE_API_MIN_INTERVAL` |
+| `SHA256 MISMATCH!` | Re-run; if it persists open an issue with the bundle slug |
+| Browser login times out | Port 8765 needed for OAuth callback — free it or use `--email` |
+| Resume re-downloads from scratch | Build URL expired or server has no range support — delete the partial `.zip` and retry |
+| `--cc0 requires an API key` | Pass `--key APIKEY` or set `CC0_CONTENT_API_KEY` |
+| CC0 search returns 401 | API key invalid or out of credits — check your dashboard |
 
 ---
 
 ## License
 
-MIT + Commons Clause. You may use the software and data for personal and commercial AI training. You may not sell, sublicense, or distribute the software itself for a fee.
+MIT + [Commons Clause](https://commonsclause.com/). Free to use and modify, including inside commercial products. You cannot sell the software itself as a standalone product or service.
