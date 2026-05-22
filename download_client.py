@@ -453,7 +453,8 @@ def _print_bundles(bundles, quiet=False):
 # ── Download flow ─────────────────────────────────────────────────────────────
 
 def _start_download(session_token, slug, kind=None):
-    body = {"slug": slug}
+    req_id = str(uuid.uuid4())
+    body = {"slug": slug, "request_id": req_id}
     if kind in ("text", "image"):
         body["kind"] = kind
     resp = _api(
@@ -462,51 +463,76 @@ def _start_download(session_token, slug, kind=None):
         json=body,
     )
     if resp.status_code == 200:
+        data = resp.json()
+        if data.get("url"):
+            return data  # cache hit — already ready
+    if resp.status_code == 202:
         return resp.json()
     sys.exit(f"  Download start failed: {_response_detail(resp)}")
 
 
-def _download_one_file(entry, output_dir, quiet):
-    name = entry.get("name") or "file"
-    url = entry.get("url") or ""
-    size = entry.get("size") or 0
-    if not url:
-        _log(f"  Skipping {name} — no URL", quiet)
-        return
-    out_path = os.path.join(output_dir, name)
-    try:
-        head = requests.head(url, timeout=15)
-        cl = int(head.headers.get("Content-Length") or size or 0)
-    except Exception:
-        cl = size
-    _serial_stream(url, out_path, cl or None, None, quiet)
+_SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
-def _download_bundle_files(files, slug, output_dir=".", workers=8, no_parallel=False, quiet=False):
-    dest = os.path.join(output_dir, slug)
-    os.makedirs(dest, exist_ok=True)
-    _log(f"\n  Downloading {len(files)} file(s) to {dest}/", quiet)
+def _poll_status(session_token, job_id, quiet=False):
+    delay = 2.0  # adaptive: starts fast, backs off to 10 s
+    spin_idx = 0
+    start_time = time.time()
+    last_files_done = -1
 
-    if no_parallel or workers <= 1 or len(files) == 1:
-        for i, entry in enumerate(files, 1):
-            _log(f"  [{i}/{len(files)}] {entry.get('name', '')}", quiet)
-            _download_one_file(entry, dest, quiet)
-    else:
-        import threading as _threading
-        lock = _threading.Lock()
-        done = [0]
+    while True:
+        try:
+            resp = _api(
+                "GET", f"/api/tui/download-bundle/status?job_id={job_id}",
+                session_token=session_token,
+            )
+        except requests.exceptions.ConnectionError:
+            if not quiet:
+                print(f"\r  ⚠ Server unreachable, retrying…{' ' * 20}", end="", flush=True)
+            time.sleep(10)
+            continue
+        if resp.status_code not in (200, 202):
+            sys.exit(f"  Status check failed: {_response_detail(resp)}")
 
-        def _fetch(entry):
-            _download_one_file(entry, dest, quiet=True)
-            with lock:
-                done[0] += 1
-                if not quiet:
-                    print(f"\r  {done[0]}/{len(files)} files done…", end="", flush=True)
+        data = resp.json()
+        status = data.get("status", "")
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(files))) as ex:
-            list(ex.map(_fetch, files))
+        if data.get("url"):
+            if not quiet:
+                print()
+            return data
+
+        if status == "failed":
+            sys.exit(f"  Build failed: {data.get('error', 'unknown error')}")
+
+        prog = data.get("progress", {})
+        files_done = prog.get("files_done", 0)
+        files_total = prog.get("files_total", "?")
+
         if not quiet:
-            print()
+            now = time.time()
+            spin = _SPINNER[spin_idx % len(_SPINNER)]
+            spin_idx += 1
+
+            elapsed = int(now - start_time)
+            elapsed_str = f"{elapsed // 60}m{elapsed % 60:02d}s"
+
+            if files_done != last_files_done:
+                last_files_done = files_done
+
+            if isinstance(files_total, int) and files_total > 0:
+                pct = int(files_done / files_total * 100)
+                bar_len = 20
+                filled = int(bar_len * files_done / files_total)
+                bar = "█" * filled + "░" * (bar_len - filled)
+                line = f"\r  {spin} [{bar}] {pct}% — {files_done}/{files_total} files  {elapsed_str}   "
+            else:
+                line = f"\r  {spin} Building… {files_done}/{files_total} files  {elapsed_str}   "
+
+            print(line, end="", flush=True)
+
+        time.sleep(delay)
+        delay = min(delay + 2.0, 10.0)
 
 
 # ── SHA256 helpers ────────────────────────────────────────────────────────────
@@ -962,25 +988,28 @@ def main():
             print("  Cancelled.")
             return
 
-    # ── Step 5: Fetch file list ────────────────────────────────────────────────
-    _log("  Fetching bundle file list…", quiet)
+    # ── Step 5: Start build ────────────────────────────────────────────────────
+    _log("  Starting bundle build…", quiet)
     result = _start_download(session_token, slug, selected.get("bundle_kind"))
 
-    files = result.get("files") or []
-    if not files:
-        sys.exit("  No files returned for this bundle.")
+    # ── Step 6: Poll if not immediately ready ──────────────────────────────────
+    if not result.get("url"):
+        job_id = result.get("job_id")
+        if not job_id:
+            sys.exit(f"  Unexpected response: {result}")
+        result = _poll_status(session_token, job_id, quiet)
 
-    total_size = result.get("total_size") or sum(f.get("size") or 0 for f in files)
-    _log(f"  {len(files)} file(s)  ({_fmt_size(total_size)} total)", quiet)
-
-    # ── Step 6: Download each file directly ───────────────────────────────────
-    _download_bundle_files(
-        files,
+    # ── Step 7: Download ───────────────────────────────────────────────────────
+    _download_zip(
+        result["url"],
         slug,
+        expected_size=result.get("size"),
+        expected_sha256=result.get("sha256"),
         output_dir=args.output_dir,
         workers=args.workers,
         no_parallel=args.no_parallel,
         quiet=quiet,
+        extract=args.extract,
     )
 
     _log("\n  Done!", quiet)
