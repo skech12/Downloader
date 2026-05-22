@@ -486,7 +486,7 @@ def _poll_status(session_token, job_id, quiet=False):
                 "GET", f"/api/tui/download-bundle/status?job_id={job_id}",
                 session_token=session_token,
             )
-        except requests.exceptions.ConnectionError:
+        except requests.exceptions.RequestException:
             if not quiet:
                 print(f"\r  ⚠ Server unreachable, retrying…{' ' * 20}", end="", flush=True)
             time.sleep(10)
