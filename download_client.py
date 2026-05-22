@@ -491,6 +491,11 @@ def _poll_status(session_token, job_id, quiet=False):
                 print(f"\r  ⚠ Server unreachable, retrying…{' ' * 20}", end="", flush=True)
             time.sleep(10)
             continue
+        if resp.status_code == 503:
+            if not quiet:
+                print(f"\r  ⚠ Server busy, retrying…{' ' * 20}", end="", flush=True)
+            time.sleep(min(delay, 5.0))
+            continue
         if resp.status_code not in (200, 202):
             sys.exit(f"  Status check failed: {_response_detail(resp)}")
 
