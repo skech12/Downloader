@@ -1,9 +1,11 @@
 import argparse
+import base64
 import concurrent.futures
 import getpass
 import hashlib
 import json
 import os
+import secrets
 import sys
 import threading
 import time
@@ -27,20 +29,12 @@ except ImportError:
 # ── Config ────────────────────────────────────────────────────────────────────
 
 DEFAULT_API_BASE_URL = "https://neurvancebackend-f7utq.ondigitalocean.app"
-DEFAULT_AUTH_BASE_URL = "https://neurvance.com"
 BASE_URL = os.environ.get("NEURVANCE_URL", DEFAULT_API_BASE_URL).rstrip("/")
-AUTH_BASE_URL = os.environ.get("NEURVANCE_AUTH_URL", DEFAULT_AUTH_BASE_URL).rstrip("/")
 API_MIN_INTERVAL = max(0.0, float(os.environ.get("NEURVANCE_API_MIN_INTERVAL", "5")))
 DOWNLOAD_CHUNK = 1024 * 1024  # 1 MB
 SESSION_CACHE_PATH = os.path.join(os.path.expanduser("~"), ".neurvance", "session.json")
 SESSION_MAX_AGE = 8 * 3600  # 8 hours
 _last_api_request_at = 0.0
-SUPABASE_REDIRECT_CONFIG_MESSAGE = (
-    "Supabase is redirecting to neurvance.com. Add the DigitalOcean callback URL "
-    "to Supabase Auth Redirect URLs: "
-    "https://neurvancebackend-f7utq.ondigitalocean.app/auth/callback and "
-    "https://neurvancebackend-f7utq.ondigitalocean.app/auth/callback**"
-)
 
 OAUTH_CALLBACK_PORT = 8765
 
@@ -134,7 +128,10 @@ def _response_detail(resp):
             "(or set NEURVANCE_URL to that value)."
         )
     try:
-        return resp.json().get("detail", resp.text)
+        detail = resp.json().get("detail", resp.text)
+        if isinstance(detail, dict):
+            return detail.get("message") or json.dumps(detail)
+        return detail
     except Exception:
         return resp.text
 
@@ -167,61 +164,6 @@ def _api(method, path, session_token=None, **kwargs):
         print(f"  Rate limited; retrying in {retry_after:.0f}s...")
         time.sleep(retry_after)
     return resp
-
-
-def _redirect_to_from_location(location):
-    if not location:
-        return ""
-    try:
-        return (parse_qs(urlparse(location).query).get("redirect_to") or [""])[0]
-    except Exception:
-        return ""
-
-
-def _validate_github_redirect_config(login_url):
-    """Best-effort preflight for the Supabase redirect URL allow-list."""
-    expected_callback = f"{AUTH_BASE_URL}/auth/callback"
-    if AUTH_BASE_URL == DEFAULT_AUTH_BASE_URL:
-        return
-    try:
-        login_resp = requests.get(
-            login_url,
-            allow_redirects=False,
-            timeout=15,
-            headers=_default_client_headers(),
-        )
-    except requests.RequestException:
-        return
-
-    if _is_cloudflare_challenge(login_resp):
-        sys.exit(f"  Browser login preflight failed: {_response_detail(login_resp)}")
-
-    supabase_location = login_resp.headers.get("Location", "")
-    if not supabase_location:
-        return
-
-    try:
-        supabase_resp = requests.get(
-            supabase_location,
-            allow_redirects=False,
-            timeout=15,
-            headers={"User-Agent": "neurvance-download-client/1.0"},
-        )
-    except requests.RequestException:
-        return
-
-    provider_location = supabase_resp.headers.get("Location", "")
-    redirect_to = _redirect_to_from_location(provider_location) or _redirect_to_from_location(supabase_location)
-    if not redirect_to:
-        return
-
-    if redirect_to.startswith("https://neurvance.com/auth/callback") or not redirect_to.startswith(expected_callback):
-        sys.exit(f"  Browser login preflight failed: {SUPABASE_REDIRECT_CONFIG_MESSAGE}")
-    if "tui_state=" not in redirect_to:
-        sys.exit(
-            "  Browser login preflight failed: Supabase did not preserve the CLI state in redirect_to. "
-            "Add https://neurvancebackend-f7utq.ondigitalocean.app/auth/callback** to Supabase Auth Redirect URLs."
-        )
 
 
 def _retry_after_seconds(resp, default):
@@ -287,13 +229,40 @@ def _validate_cached_session(session_token):
 
 # ── Login: GitHub OAuth (browser) ─────────────────────────────────────────────
 
-def _login_github():
-    callback_url = f"http://127.0.0.1:{OAUTH_CALLBACK_PORT}/callback"
-    login_url = f"{AUTH_BASE_URL}/auth/github/login?tui_redirect={quote(callback_url, safe='')}"
+def _b64url_nopad(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
-    print("  Checking GitHub redirect configuration...", end=" ", flush=True)
-    _validate_github_redirect_config(login_url)
+
+def _generate_pkce():
+    verifier = _b64url_nopad(secrets.token_bytes(32))
+    challenge = _b64url_nopad(hashlib.sha256(verifier.encode("ascii")).digest())
+    return verifier, challenge
+
+
+def _login_github():
+    callback_base_url = f"http://127.0.0.1:{OAUTH_CALLBACK_PORT}/callback"
+
+    print("  Fetching auth config...", end=" ", flush=True)
+    config_resp = _api("GET", "/api/tui/auth-config")
+    if config_resp.status_code != 200:
+        print("FAILED")
+        sys.exit(f"  Could not fetch auth config: {_response_detail(config_resp)}")
+    supabase_url = (config_resp.json() or {}).get("supabase_url", "").rstrip("/")
+    if not supabase_url:
+        print("FAILED")
+        sys.exit("  Server did not return a Supabase URL.")
     print("OK")
+
+    verifier, challenge = _generate_pkce()
+    cli_state = _b64url_nopad(secrets.token_bytes(32))
+    callback_url = f"{callback_base_url}?cli_state={quote(cli_state, safe='')}"
+    authorize_url = (
+        f"{supabase_url}/auth/v1/authorize"
+        f"?provider=github"
+        f"&redirect_to={quote(callback_url, safe='')}"
+        f"&code_challenge={challenge}"
+        f"&code_challenge_method=s256"
+    )
 
     received = {}
     server_done = threading.Event()
@@ -303,13 +272,15 @@ def _login_github():
             parsed = urlparse(self.path)
             if parsed.path == "/callback":
                 params = parse_qs(parsed.query)
-                received["token"] = (params.get("token") or [""])[0]
-                received["error"] = (params.get("error") or [""])[0]
-                received["message"] = (params.get("message") or [""])[0]
+                received["code"] = (params.get("code") or [""])[0]
+                received["cli_state"] = (params.get("cli_state") or [""])[0]
+                received["error"] = (
+                    (params.get("error_description") or params.get("error") or [""])[0]
+                )
                 if received["error"]:
                     body = (
                         "<html><body><h2>Login needs attention</h2>"
-                        f"<p>{received['message'] or received['error']}</p>"
+                        f"<p>{received['error']}</p>"
                         "</body></html>"
                     ).encode("utf-8")
                 else:
@@ -319,15 +290,21 @@ def _login_github():
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+                server_done.set()
             else:
                 self.send_response(404)
                 self.end_headers()
-            server_done.set()
 
         def log_message(self, *_):
             pass
 
-    httpd = HTTPServer(("127.0.0.1", OAUTH_CALLBACK_PORT), _Handler)
+    try:
+        httpd = HTTPServer(("127.0.0.1", OAUTH_CALLBACK_PORT), _Handler)
+    except OSError as e:
+        sys.exit(
+            f"  Could not bind local callback server on port {OAUTH_CALLBACK_PORT}: {e}\n"
+            "  Another process may be using the port. Close it and try again."
+        )
     httpd.timeout = 1
 
     def _serve():
@@ -340,34 +317,50 @@ def _login_github():
     t.start()
 
     print(f"  Opening your browser for GitHub login…")
-    print(f"  If it doesn't open, visit:\n  {login_url}")
-    webbrowser.open(login_url)
+    print(f"  If it doesn't open, visit:\n  {authorize_url}")
+    webbrowser.open(authorize_url)
 
     print("  Waiting for browser login (timeout 120 s)…", end=" ", flush=True)
     server_done.wait(timeout=120)
 
-    bearer = received.get("token", "")
     if received.get("error"):
         print("FAILED")
-        detail = received.get("message") or received.get("error")
-        sys.exit(f"  Browser login error: {detail}")
-    if not bearer:
+        sys.exit(f"  Browser login error: {received['error']}")
+    if received.get("cli_state") != cli_state:
+        print("FAILED")
+        sys.exit("  Browser login error: CLI state mismatch. Please try again.")
+    code = received.get("code", "")
+    if not code:
         print("TIMED OUT")
         sys.exit(
-            "  Browser login did not complete. Try again or use email login.\n"
-            f"  If your browser showed https://neurvance.com/auth/callback?code=..., {SUPABASE_REDIRECT_CONFIG_MESSAGE}"
+            "  Browser login did not complete.\n"
+            f"  If Supabase rejected the callback URL, add this exact value to the\n"
+            f"  Supabase project's Auth → URL Configuration → Redirect URLs:\n"
+            f"      {callback_base_url}\n"
+            "  (and http://localhost:8765/callback). Then try again."
         )
-
     print("OK")
-    print("  Creating session…", end=" ", flush=True)
-    resp = _api("POST", "/api/tui/session", headers={"Authorization": f"Bearer {bearer}"})
-    if resp.status_code != 200:
+
+    print("  Exchanging code for session…", end=" ", flush=True)
+    exchange_resp = _api(
+        "POST",
+        "/api/tui/oauth-exchange",
+        json={
+            "auth_code": code,
+            "code_verifier": verifier,
+            "redirect_to": callback_url,
+        },
+    )
+    if exchange_resp.status_code != 200:
         print("FAILED")
-        sys.exit(f"  Session error: {_response_detail(resp)}")
-
-    data = resp.json()
+        sys.exit(f"  Code exchange error: {_response_detail(exchange_resp)}")
+    data = exchange_resp.json() or {}
+    session_token = data.get("session_token", "")
+    if not session_token:
+        print("FAILED")
+        sys.exit("  Server did not return a session token.")
     print("OK")
-    return data["session_token"], data.get("calls_remaining", "?")
+    return session_token, data.get("calls_remaining", "?")
 
 
 # ── Login: Email / Password ───────────────────────────────────────────────────
